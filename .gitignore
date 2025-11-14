@@ -3,6 +3,7 @@ backend/node_modules/
 backend/.venv/
 .next/
 .env
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
