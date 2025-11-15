@@ -2,9 +2,11 @@
 
 import { useEffect, useRef } from "react";
 import type { MutableRefObject } from "react";
-import maplibregl, { LngLatBoundsLike, Map } from "maplibre-gl";
+import maplibregl, { LngLatBoundsLike, Map, type StyleSpecification } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { FeatureCollection } from "geojson";
+
+type BasemapMode = "imagery" | "vector";
 
 interface Props {
   center: { lat: number; lon: number };
@@ -13,10 +15,34 @@ interface Props {
   loading: boolean;
   sceneInfo?: Record<string, unknown>;
   showSelection: boolean;
+  basemap: BasemapMode;
   onBoundsChange?: (bbox: [number, number, number, number]) => void;
 }
 
-const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
+const BASEMAP_STYLES: Record<BasemapMode, StyleSpecification | string> = {
+  imagery: {
+    version: 8,
+    sources: {
+      "esri-world-imagery": {
+        type: "raster",
+        tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+        tileSize: 256,
+        attribution:
+          "Source: Esri, Maxar, Earthstar Geographics, CNES/Airbus DS, USDA, USGS, AeroGRID, IGN, GIS User Community",
+      },
+    },
+    layers: [
+      {
+        id: "esri-world-imagery",
+        type: "raster",
+        source: "esri-world-imagery",
+        minzoom: 0,
+        maxzoom: 22,
+      },
+    ],
+  },
+  vector: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+};
 const PREVIEW_SOURCE_ID = "earth-art-image";
 const PREVIEW_LAYER_ID = `${PREVIEW_SOURCE_ID}-layer`;
 const SELECTION_SOURCE_ID = "selection-bounds";
@@ -93,10 +119,12 @@ export default function PreviewPane({
   loading,
   sceneInfo,
   showSelection,
+  basemap,
   onBoundsChange,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
+  const basemapRef = useRef<BasemapMode>(basemap);
   const bboxRef = useRef<typeof bbox>();
   const boundsCallbackRef = useRef<typeof onBoundsChange>();
   const lastPreviewRef = useRef<{ url: string; coords: [number, number][]; bbox: [number, number, number, number] } | null>(
@@ -120,7 +148,7 @@ export default function PreviewPane({
     if (!containerRef.current || mapRef.current) return;
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: MAP_STYLE,
+      style: BASEMAP_STYLES[basemap],
       center: [center.lon, center.lat],
       zoom: 8,
       fadeDuration: 0,
@@ -160,7 +188,15 @@ export default function PreviewPane({
       map.remove();
       mapRef.current = null;
     };
-  }, [center.lat, center.lon]);
+  }, [center.lat, center.lon, basemap]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (basemapRef.current === basemap) return;
+    basemapRef.current = basemap;
+    map.setStyle(BASEMAP_STYLES[basemap]);
+  }, [basemap]);
 
   useEffect(() => {
     const map = mapRef.current;

@@ -260,7 +260,8 @@ def compose_nmf(stack: xr.DataArray, palette: str = "vivid") -> np.ndarray:
         return np.zeros((3, height, width), dtype="float32")
     sample = sample - sample.min(axis=0, keepdims=True)
     sample = np.clip(sample, 0, None).astype("float32")
-    nmf = NMF(n_components=3, init="nndsvd", random_state=0, max_iter=200)
+    # Increase max_iter to reduce ConvergenceWarning on larger scenes.
+    nmf = NMF(n_components=3, init="nndsvd", random_state=0, max_iter=500)
     nmf.fit(sample)
     weights = nmf.components_.astype("float32")
     mins = da.nanmin(arr, axis=(1, 2)).reshape((bands, 1, 1))

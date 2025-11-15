@@ -41,6 +41,7 @@ export default function Page() {
   const [bgMode, setBgMode] = useState<"imagery" | "solid">("imagery");
   const [bgColor, setBgColor] = useState("#0e0e10");
   const [overlays, setOverlays] = useState<OverlayOptions>({ roads: false, buildings: false });
+  const [basemapMode, setBasemapMode] = useState<"imagery" | "vector">("imagery");
   const [preview, setPreview] = useState<PreviewState>({});
   const [showSelection, setShowSelection] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -279,6 +280,29 @@ export default function Page() {
             )}
           </div>
         </div>
+        <div className="style-card">
+          <p className="card-title">Map basemap</p>
+          <div className="background-modes">
+            <label>
+              <input
+                type="radio"
+                name="map-style"
+                checked={basemapMode === "imagery"}
+                onChange={() => setBasemapMode("imagery")}
+              />
+              Imagery
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="map-style"
+                checked={basemapMode === "vector"}
+                onChange={() => setBasemapMode("vector")}
+              />
+              Basic
+            </label>
+          </div>
+        </div>
         <OverlayToggles overlays={overlays} onChange={setOverlays} />
         <label className="selection-toggle">
           <input type="checkbox" checked={showSelection} onChange={(e) => setShowSelection(e.target.checked)} />
@@ -302,6 +326,7 @@ export default function Page() {
           loading={loading}
           sceneInfo={preview.scene}
           showSelection={showSelection}
+          basemap={basemapMode}
           onBoundsChange={setMapBounds}
         />
       </section>
