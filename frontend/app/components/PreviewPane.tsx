@@ -1,23 +1,34 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import type { MutableRefObject } from "react";
-import maplibregl, { LngLatBoundsLike, Map, type StyleSpecification } from "maplibre-gl";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import maplibregl, { type Map, type StyleSpecification, type ImageSource as MapImageSource } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { FeatureCollection } from "geojson";
 
 type BasemapMode = "imagery" | "vector";
+type ViewState = { latitude: number; longitude: number; zoom: number };
+
+type AoiRect = { x: number; y: number; width: number; height: number };
+type AoiBounds = { west: number; south: number; east: number; north: number };
 
 interface Props {
-  center: { lat: number; lon: number };
-  bbox?: [number, number, number, number];
-  previewBase64?: string;
+  selectedSizeKm: number;
+  sizeCommand: number | null;
+  drawCommand: number;
+  clearCommand: number;
+  flyToTarget?: { lat: number; lon: number; token: number } | null;
+  previewImageUrl?: string | null;
   loading: boolean;
   sceneInfo?: Record<string, unknown>;
   showSelection: boolean;
   basemap: BasemapMode;
   onBoundsChange?: (bbox: [number, number, number, number]) => void;
+  onAoiBoundsChange?: (bbox: [number, number, number, number] | null) => void;
+  onClearPreview?: () => void;
+  onSizeCommandHandled?: () => void;
 }
+
+const DEFAULT_VIEW: ViewState = { latitude: 32.7157, longitude: -117.1611, zoom: 8 };
+const EARTH_RADIUS_M = 6378137;
 
 const BASEMAP_STYLES: Record<BasemapMode, StyleSpecification | string> = {
   imagery: {
@@ -43,152 +54,168 @@ const BASEMAP_STYLES: Record<BasemapMode, StyleSpecification | string> = {
   },
   vector: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
 };
-const PREVIEW_SOURCE_ID = "earth-art-image";
-const PREVIEW_LAYER_ID = `${PREVIEW_SOURCE_ID}-layer`;
-const SELECTION_SOURCE_ID = "selection-bounds";
-const SELECTION_LAYER_ID = `${SELECTION_SOURCE_ID}-line`;
 
-function base64PngToBlobUrl(b64: string): string {
-  const prefix = "data:image";
-  const clean = b64.startsWith(prefix) ? b64.split(",")[1] : b64;
-  const binary = atob(clean);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  const blob = new Blob([bytes], { type: "image/png" });
-  return URL.createObjectURL(blob);
-}
+const PREVIEW_SOURCE_ID = "preview-image-source";
+const PREVIEW_LAYER_ID = "preview-image-layer";
 
-function coordsFromBbox(bbox: [number, number, number, number]): [number, number][] {
-  const [minX, minY, maxX, maxY] = bbox;
-  return [
-    [minX, maxY],
-    [maxX, maxY],
-    [maxX, minY],
-    [minX, minY],
-  ];
-}
-
-function hashBase64(b64: string): string {
-  const clean = b64.startsWith("data:image") ? b64.split(",")[1] : b64;
-  let hash = 2166136261 >>> 0;
-  for (let i = 0; i < clean.length; i += 1) {
-    hash ^= clean.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16);
-}
-
-async function onStyleReady(map: maplibregl.Map): Promise<void> {
-  if (map.isStyleLoaded()) return;
-  await new Promise<void>((resolve) => {
-    map.once("idle", () => resolve());
-  });
-}
-
-function bboxPolygon(bounds: [number, number, number, number]): FeatureCollection {
-  const [minLon, minLat, maxLon, maxLat] = bounds;
-  return {
-    type: "FeatureCollection",
-    features: [
-      {
-        type: "Feature",
-        geometry: {
-          type: "Polygon",
-          coordinates: [
-            [
-              [minLon, minLat],
-              [minLon, maxLat],
-              [maxLon, maxLat],
-              [maxLon, minLat],
-              [minLon, minLat],
-            ],
-          ],
-        },
-        properties: {},
-      },
-    ],
-  } satisfies FeatureCollection;
+function kmToZoom(widthKm: number, mapWidthPx: number, latitude: number): number {
+  const widthM = widthKm * 1000;
+  const metersPerPixel = widthM / Math.max(mapWidthPx, 1);
+  const latRad = (latitude * Math.PI) / 180;
+  const numerator = Math.cos(latRad) * 2 * Math.PI * EARTH_RADIUS_M;
+  const zoom = Math.log2(numerator / (metersPerPixel * 256));
+  return Math.max(0, Math.min(22, zoom));
 }
 
 export default function PreviewPane({
-  center,
-  bbox,
-  previewBase64,
+  selectedSizeKm,
+  sizeCommand,
+  drawCommand,
+  clearCommand,
+  flyToTarget,
+  previewImageUrl,
   loading,
   sceneInfo,
   showSelection,
   basemap,
   onBoundsChange,
+  onAoiBoundsChange,
+  onClearPreview,
+  onSizeCommandHandled,
 }: Props) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapContainerRef = useRef<HTMLDivElement | null>(null);
+  const mapCanvasRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
   const basemapRef = useRef<BasemapMode>(basemap);
-  const bboxRef = useRef<typeof bbox>();
-  const boundsCallbackRef = useRef<typeof onBoundsChange>();
-  const lastPreviewRef = useRef<{ url: string; coords: [number, number][]; bbox: [number, number, number, number] } | null>(
-    null,
+  const [viewState, setViewState] = useState<ViewState>(DEFAULT_VIEW);
+  const viewStateRef = useRef<ViewState>(DEFAULT_VIEW);
+  const aoiRectRef = useRef<AoiRect | null>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [aoiRect, setAoiRect] = useState<AoiRect | null>(null);
+  const [latestBounds, setLatestBounds] = useState<AoiBounds | null>(null);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const flyTokenRef = useRef<number | null>(null);
+
+  const removePreviewLayer = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (map.getLayer(PREVIEW_LAYER_ID)) {
+      map.removeLayer(PREVIEW_LAYER_ID);
+    }
+    if (map.getSource(PREVIEW_SOURCE_ID)) {
+      map.removeSource(PREVIEW_SOURCE_ID);
+    }
+  }, []);
+
+  const pushBounds = useCallback(
+    (bounds: AoiBounds | null) => {
+      setLatestBounds(bounds);
+      if (onAoiBoundsChange) {
+        onAoiBoundsChange(bounds ? [bounds.west, bounds.south, bounds.east, bounds.north] : null);
+      }
+    },
+    [onAoiBoundsChange],
   );
-  const lastObjectUrlRef = useRef<string | null>(null);
-  const lastHashRef = useRef<string | null>(null);
-  const lastCoordsRef = useRef<string | null>(null);
-  const restoringRef = useRef(false);
-  const debounceRef = useRef<NodeJS.Timeout | null>(null);
+
+  const clearAoi = useCallback(
+    (reason: string) => {
+      console.log("[PreviewPane] AOI cleared:", reason);
+      setAoiRect(null);
+      pushBounds(null);
+      dragStartRef.current = null;
+      removePreviewLayer();
+      if (onClearPreview) onClearPreview();
+    },
+    [onClearPreview, pushBounds, removePreviewLayer],
+  );
+
+  const computeBounds = useCallback(
+    (rect: AoiRect | null): AoiBounds | null => {
+      if (!rect || !mapRef.current) return null;
+      const topLeft = mapRef.current.unproject([rect.x, rect.y]);
+      const bottomRight = mapRef.current.unproject([rect.x + rect.width, rect.y + rect.height]);
+      return {
+        west: topLeft.lng,
+        south: bottomRight.lat,
+        east: bottomRight.lng,
+        north: topLeft.lat,
+      };
+    },
+    [],
+  );
+
+
+  const syncViewFromMap = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const center = map.getCenter();
+    const zoom = map.getZoom();
+    setViewState({ latitude: center.lat, longitude: center.lng, zoom });
+    viewStateRef.current = { latitude: center.lat, longitude: center.lng, zoom };
+  }, []);
+
+  const handleMapMove = useCallback(
+    (evt: maplibregl.MapboxEvent<MouseEvent | TouchEvent | WheelEvent> & maplibregl.EventData) => {
+      const { lat, lng } = evt.target.getCenter();
+      const zoom = evt.target.getZoom();
+      setViewState({ latitude: lat, longitude: lng, zoom });
+      viewStateRef.current = { latitude: lat, longitude: lng, zoom };
+    },
+    [],
+  );
 
   useEffect(() => {
-    bboxRef.current = bbox;
-  }, [bbox]);
+    viewStateRef.current = viewState;
+  }, [viewState]);
 
   useEffect(() => {
-    boundsCallbackRef.current = onBoundsChange;
-  }, [onBoundsChange]);
+    aoiRectRef.current = aoiRect;
+  }, [aoiRect]);
+
+  const applyFlyTo = useCallback(() => {
+    if (!mapRef.current || !flyToTarget) return;
+    const map = mapRef.current;
+    flyTokenRef.current = flyToTarget.token;
+    setViewState((prev) => ({ ...prev, latitude: flyToTarget.lat, longitude: flyToTarget.lon }));
+    map.easeTo({
+      center: [flyToTarget.lon, flyToTarget.lat],
+      zoom: viewState.zoom,
+      duration: 0,
+    });
+  }, [flyToTarget, viewState.zoom]);
 
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return;
+    if (!mapCanvasRef.current || mapRef.current) return;
     const map = new maplibregl.Map({
-      container: containerRef.current,
+      container: mapCanvasRef.current,
       style: BASEMAP_STYLES[basemap],
-      center: [center.lon, center.lat],
-      zoom: 8,
+      center: [DEFAULT_VIEW.longitude, DEFAULT_VIEW.latitude],
+      zoom: DEFAULT_VIEW.zoom,
       fadeDuration: 0,
     });
     mapRef.current = map;
 
-    const handleLoad = () => {
-      if (bboxRef.current) fitBounds(map, bboxRef.current);
-      if (boundsCallbackRef.current) {
-        const bounds = map.getBounds();
-        boundsCallbackRef.current([bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()]);
+    map.on("load", () => {
+      if (onBoundsChange) {
+        const b = map.getBounds();
+        onBoundsChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
       }
-    };
-
-    const handleStyleData = () => {
-      if (lastPreviewRef.current) {
-        restorePreviewOverlay(map, lastPreviewRef.current, restoringRef).catch((error) =>
-          console.warn("[overlay] restore failed", error),
-        );
+      syncViewFromMap();
+    });
+    map.on("move", handleMapMove);
+    map.on("moveend", () => {
+      if (onBoundsChange) {
+        const b = map.getBounds();
+        onBoundsChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
       }
-    };
-
-    const handleMoveEnd = () => {
-      if (!boundsCallbackRef.current) return;
-      const bounds = map.getBounds();
-      boundsCallbackRef.current([bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()]);
-    };
-
-    map.on("load", handleLoad);
-    map.on("styledata", handleStyleData);
-    map.on("moveend", handleMoveEnd);
-
-    return () => {
-      map.off("load", handleLoad);
-      map.off("styledata", handleStyleData);
-      map.off("moveend", handleMoveEnd);
-      map.remove();
-      mapRef.current = null;
-    };
-  }, [center.lat, center.lon, basemap]);
+      const rect = aoiRectRef.current;
+      if (rect && !previewImageUrl) {
+        const bounds = computeBounds(rect);
+        if (bounds) pushBounds(bounds);
+      }
+    });
+  }, [basemap, computeBounds, handleMapMove, onBoundsChange, previewImageUrl, pushBounds, syncViewFromMap]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -198,69 +225,241 @@ export default function PreviewPane({
     map.setStyle(BASEMAP_STYLES[basemap]);
   }, [basemap]);
 
-  useEffect(() => {
+  const applyPreviewLayer = useCallback(() => {
     const map = mapRef.current;
-    const container = containerRef.current;
-    if (!map || !container) return;
-    const observer = new ResizeObserver(() => map.resize());
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(
-    () => () => {
-      if (lastObjectUrlRef.current) URL.revokeObjectURL(lastObjectUrlRef.current);
-    },
-    [],
-  );
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !bbox) return;
-    (async () => {
-      await upsertSelectionLayer(map, bbox, showSelection);
-      fitBounds(map, bbox);
-    })();
-  }, [bbox, showSelection]);
+    if (!map || !previewImageUrl || !latestBounds) return;
+    const coordinates: [number, number][] = [
+      [latestBounds.west, latestBounds.north],
+      [latestBounds.east, latestBounds.north],
+      [latestBounds.east, latestBounds.south],
+      [latestBounds.west, latestBounds.south],
+    ];
+    const existing = map.getSource(PREVIEW_SOURCE_ID) as MapImageSource | undefined;
+    if (existing && existing.type === "image") {
+      existing.updateImage({ url: previewImageUrl, coordinates });
+    } else {
+      removePreviewLayer();
+      map.addSource(PREVIEW_SOURCE_ID, {
+        type: "image",
+        url: previewImageUrl,
+        coordinates,
+      });
+      map.addLayer({
+        id: PREVIEW_LAYER_ID,
+        type: "raster",
+        source: PREVIEW_SOURCE_ID,
+        paint: { "raster-opacity": 1 },
+      });
+    }
+  }, [latestBounds, previewImageUrl, removePreviewLayer]);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!previewImageUrl || !latestBounds) {
+      removePreviewLayer();
+      return;
+    }
+    if (!map.isStyleLoaded()) {
+      const handler = () => applyPreviewLayer();
+      map.once("styledata", handler);
+      return () => {
+        map.off("styledata", handler);
+      };
+    }
+    applyPreviewLayer();
+  }, [applyPreviewLayer, latestBounds, previewImageUrl, removePreviewLayer]);
 
-    debounceRef.current = setTimeout(() => {
-      if (!previewBase64 || !bbox) {
-        removePreviewImage(map);
-        if (lastObjectUrlRef.current) {
-          URL.revokeObjectURL(lastObjectUrlRef.current);
-          lastObjectUrlRef.current = null;
-        }
-        lastPreviewRef.current = null;
-        lastHashRef.current = null;
-        lastCoordsRef.current = null;
-        return;
-      }
-      const coords = coordsFromBbox(bbox);
-      upsertImageOverlay(
-        map,
-        previewBase64,
-        bbox,
-        coords,
-        lastPreviewRef,
-        lastObjectUrlRef,
-        lastHashRef,
-        lastCoordsRef,
-      );
-    }, 250);
 
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
+  useEffect(() => {
+    applyFlyTo();
+  }, [applyFlyTo, flyToTarget]);
+
+  const toggleMapInteractions = useCallback((enable: boolean) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const action = enable ? "enable" : "disable";
+    map.dragPan[action]();
+    map.scrollZoom[action]?.();
+    map.doubleClickZoom[action]?.();
+  }, []);
+
+  useEffect(() => {
+    if (sizeCommand == null) return;
+    if (!mapRef.current || !mapContainerRef.current) return;
+    const map = mapRef.current;
+    const { latitude, longitude } = viewStateRef.current;
+    const widthPx = mapContainerRef.current.clientWidth || 256;
+    const targetZoom = kmToZoom(sizeCommand, widthPx, latitude);
+    map.easeTo({
+      center: [longitude, latitude],
+      zoom: targetZoom,
+      duration: 0,
+    });
+    setViewState({ latitude, longitude, zoom: targetZoom });
+    clearAoi("size preset applied");
+    setIsDrawing(false);
+    setIsDragging(false);
+    toggleMapInteractions(true);
+    dragStartRef.current = null;
+    if (onSizeCommandHandled) onSizeCommandHandled();
+  }, [clearAoi, onSizeCommandHandled, sizeCommand, toggleMapInteractions]);
+
+  const updateRectFromClient = useCallback(
+    (clientX: number, clientY: number) => {
+      if (!dragStartRef.current || !mapContainerRef.current) return;
+      const rect = mapContainerRef.current.getBoundingClientRect();
+      const currX = clientX - rect.left;
+      const currY = clientY - rect.top;
+      const startX = dragStartRef.current.x;
+      const startY = dragStartRef.current.y;
+      const x = Math.min(startX, currX);
+      const y = Math.min(startY, currY);
+      const width = Math.abs(currX - startX);
+      const height = Math.abs(currY - startY);
+      setAoiRect({ x, y, width, height });
+    },
+    [],
+  );
+
+  const finalizeAoi = useCallback(() => {
+    setIsDragging(false);
+    setIsDrawing(false);
+    toggleMapInteractions(true);
+    const rect = aoiRectRef.current;
+    if (!rect || !mapRef.current) {
+      console.warn("[PreviewPane] finalizeAoi missing rect or map");
+      dragStartRef.current = null;
+      return;
+    }
+    const MIN_SIZE = 20;
+    if (rect.width < MIN_SIZE || rect.height < MIN_SIZE) {
+      clearAoi("drawn AOI too small");
+      return;
+    }
+    const map = mapRef.current;
+    const topLeft = map.unproject([rect.x, rect.y]);
+    const bottomRight = map.unproject([rect.x + rect.width, rect.y + rect.height]);
+    const bounds: AoiBounds = {
+      west: topLeft.lng,
+      north: topLeft.lat,
+      east: bottomRight.lng,
+      south: bottomRight.lat,
     };
-  }, [previewBase64, bbox]);
+    console.log("[PreviewPane] finalizeAoi computed bounds:", bounds);
+    pushBounds(bounds);
+    dragStartRef.current = null;
+  }, [clearAoi, pushBounds, toggleMapInteractions]);
+
+  const handleOverlayMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!isDrawing || e.button !== 0 || !mapContainerRef.current) return;
+      e.preventDefault();
+      const rect = mapContainerRef.current.getBoundingClientRect();
+      const startX = e.clientX - rect.left;
+      const startY = e.clientY - rect.top;
+      dragStartRef.current = { x: startX, y: startY };
+      setIsDragging(true);
+      toggleMapInteractions(false);
+      setAoiRect({ x: startX, y: startY, width: 0, height: 0 });
+      if (onClearPreview) onClearPreview();
+    },
+    [isDrawing, onClearPreview, toggleMapInteractions],
+  );
+
+  const handleOverlayMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!isDrawing || !isDragging) return;
+      e.preventDefault();
+      updateRectFromClient(e.clientX, e.clientY);
+    },
+    [isDragging, isDrawing, updateRectFromClient],
+  );
+
+  const handleOverlayMouseUp = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!isDrawing || !isDragging) return;
+      e.preventDefault();
+      updateRectFromClient(e.clientX, e.clientY);
+      finalizeAoi();
+    },
+    [finalizeAoi, isDragging, isDrawing, updateRectFromClient],
+  );
+
+  const handleOverlayMouseLeave = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!isDrawing || !isDragging) return;
+      e.preventDefault();
+      updateRectFromClient(e.clientX, e.clientY);
+      finalizeAoi();
+    },
+    [finalizeAoi, isDragging, isDrawing, updateRectFromClient],
+  );
+
+  const drawInitRef = useRef(false);
+  useEffect(() => {
+    if (!drawInitRef.current) {
+      drawInitRef.current = true;
+      return;
+    }
+    if (drawCommand <= 0) return;
+    clearAoi("draw command start");
+    setIsDrawing(true);
+    setIsDragging(false);
+    dragStartRef.current = null;
+    toggleMapInteractions(false);
+  }, [clearAoi, drawCommand, toggleMapInteractions]);
+
+  const clearInitRef = useRef(false);
+  useEffect(() => {
+    if (!clearInitRef.current) {
+      clearInitRef.current = true;
+      return;
+    }
+    clearAoi("external clear command");
+    setIsDrawing(false);
+    setIsDragging(false);
+    dragStartRef.current = null;
+    toggleMapInteractions(true);
+  }, [clearAoi, clearCommand, toggleMapInteractions]);
+
+  const aoiBorder = useMemo(() => {
+    if (!aoiRect) return null;
+    return (
+      <div
+        className="aoi-border"
+        style={{
+          position: "absolute",
+          left: aoiRect.x,
+          top: aoiRect.y,
+          width: aoiRect.width,
+          height: aoiRect.height,
+          border: showSelection ? "3px solid #ff4d4f" : "3px solid transparent",
+          pointerEvents: "none",
+          boxSizing: "border-box",
+        }}
+      />
+    );
+  }, [aoiRect, showSelection]);
 
   return (
-    <div className="map-wrapper">
-      <div ref={containerRef} className="map-canvas" />
+    <div className="map-wrapper" ref={mapContainerRef}>
+      <div className="map-canvas" ref={mapCanvasRef} />
+      {aoiBorder}
+      <div
+        className="draw-overlay"
+        onMouseDown={handleOverlayMouseDown}
+        onMouseMove={handleOverlayMouseMove}
+        onMouseUp={handleOverlayMouseUp}
+        onMouseLeave={handleOverlayMouseLeave}
+        style={{
+          position: "absolute",
+          inset: 0,
+          cursor: isDrawing ? "crosshair" : "default",
+          pointerEvents: isDrawing ? "auto" : "none",
+          background: "transparent",
+        }}
+      />
       {sceneInfo && (
         <div className="meta-badge">
           <div>{String(sceneInfo["id"] ?? "")}</div>
@@ -312,143 +511,4 @@ export default function PreviewPane({
       `}</style>
     </div>
   );
-}
-
-async function upsertImageOverlay(
-  map: Map,
-  base64: string,
-  bbox: [number, number, number, number],
-  coords: [number, number][],
-  lastPreviewRef: MutableRefObject<{
-    url: string;
-    coords: [number, number][];
-    bbox: [number, number, number, number];
-  } | null>,
-  lastObjectUrlRef: MutableRefObject<string | null>,
-  lastHashRef: MutableRefObject<string | null>,
-  lastCoordsRef: MutableRefObject<string | null>,
-) {
-  await onStyleReady(map);
-  const hash = hashBase64(base64);
-  const coordsKey = JSON.stringify(coords);
-  if (hash === lastHashRef.current && coordsKey === lastCoordsRef.current) {
-    console.debug("[overlay] unchanged preview");
-    fitBounds(map, bbox);
-    return;
-  }
-  const objectUrl = base64PngToBlobUrl(base64);
-  if (lastObjectUrlRef.current && lastObjectUrlRef.current !== objectUrl) {
-    URL.revokeObjectURL(lastObjectUrlRef.current);
-  }
-  lastObjectUrlRef.current = objectUrl;
-  console.debug("[overlay] bbox", bbox, "src?", !!map.getSource(PREVIEW_SOURCE_ID), "lyr?", !!map.getLayer(PREVIEW_LAYER_ID));
-  try {
-    const existing = map.getSource(PREVIEW_SOURCE_ID) as maplibregl.ImageSource | undefined;
-    if (existing) {
-      existing.setCoordinates(coords);
-      await existing.updateImage({ url: objectUrl });
-    } else {
-      map.addSource(PREVIEW_SOURCE_ID, { type: "image", url: objectUrl, coordinates: coords });
-      if (!map.getLayer(PREVIEW_LAYER_ID)) {
-        map.addLayer({
-          id: PREVIEW_LAYER_ID,
-          type: "raster",
-          source: PREVIEW_SOURCE_ID,
-          paint: { "raster-opacity": 1, "raster-resampling": "linear" },
-        });
-      }
-    }
-  } catch (error) {
-    console.warn("[overlay] re-add after failure", error);
-    removePreviewImage(map);
-    map.addSource(PREVIEW_SOURCE_ID, { type: "image", url: objectUrl, coordinates: coords });
-    map.addLayer({
-      id: PREVIEW_LAYER_ID,
-      type: "raster",
-      source: PREVIEW_SOURCE_ID,
-      paint: { "raster-opacity": 1, "raster-resampling": "linear" },
-    });
-  }
-  try {
-    map.moveLayer(PREVIEW_LAYER_ID);
-  } catch {
-    // ignore
-  }
-  lastHashRef.current = hash;
-  lastCoordsRef.current = coordsKey;
-  lastPreviewRef.current = { url: objectUrl, coords, bbox };
-  fitBounds(map, bbox);
-}
-
-async function restorePreviewOverlay(
-  map: Map,
-  preview: { url: string; coords: [number, number][] } | null,
-  restoringRef: MutableRefObject<boolean>,
-) {
-  if (!preview || restoringRef.current) return;
-  const hasSource = !!map.getSource(PREVIEW_SOURCE_ID);
-  const hasLayer = !!map.getLayer(PREVIEW_LAYER_ID);
-  if (hasSource && hasLayer) return;
-  restoringRef.current = true;
-  try {
-    await onStyleReady(map);
-    const { url, coords } = preview;
-    if (!hasSource) {
-      map.addSource(PREVIEW_SOURCE_ID, { type: "image", url, coordinates: coords });
-    }
-    if (!hasLayer) {
-      map.addLayer({
-        id: PREVIEW_LAYER_ID,
-        type: "raster",
-        source: PREVIEW_SOURCE_ID,
-        paint: { "raster-opacity": 1, "raster-resampling": "linear" },
-      });
-    }
-    try {
-      map.moveLayer(PREVIEW_LAYER_ID);
-    } catch {
-      // ignore
-    }
-  } catch (error) {
-    console.warn("[overlay] restore error", error);
-  } finally {
-    restoringRef.current = false;
-  }
-}
-
-function fitBounds(map: Map, bbox: [number, number, number, number]) {
-  map.fitBounds(
-    [
-      [bbox[0], bbox[1]],
-      [bbox[2], bbox[3]],
-    ] as LngLatBoundsLike,
-    { padding: 24, animate: false },
-  );
-}
-
-async function upsertSelectionLayer(map: Map, bbox: [number, number, number, number], visible: boolean) {
-  await onStyleReady(map);
-  const geojson = bboxPolygon(bbox);
-  if (map.getSource(SELECTION_SOURCE_ID)) {
-    const source = map.getSource(SELECTION_SOURCE_ID) as maplibregl.GeoJSONSource;
-    source.setData(geojson);
-  } else {
-    map.addSource(SELECTION_SOURCE_ID, { type: "geojson", data: geojson });
-    map.addLayer({
-      id: SELECTION_LAYER_ID,
-      type: "line",
-      source: SELECTION_SOURCE_ID,
-      paint: { "line-color": "#ef4444", "line-width": 2 },
-    });
-  }
-  map.setLayoutProperty(SELECTION_LAYER_ID, "visibility", visible ? "visible" : "none");
-}
-
-function removePreviewImage(map: Map) {
-  if (map.getLayer(PREVIEW_LAYER_ID)) {
-    map.removeLayer(PREVIEW_LAYER_ID);
-  }
-  if (map.getSource(PREVIEW_SOURCE_ID)) {
-    map.removeSource(PREVIEW_SOURCE_ID);
-  }
 }

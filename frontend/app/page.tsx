@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { exportImage, fetchPreview, IndexPack, OverlayOptions, Palette, Theme } from "./api";
 import OverlayToggles from "./components/OverlayToggles";
@@ -19,15 +19,27 @@ type PreviewState = {
   scene?: Record<string, unknown>;
 };
 
-function bboxFromCenter(lat: number, lon: number, sizeKm: number): [number, number, number, number] {
-  const halfDegLat = (sizeKm / 2) / 111;
-  const halfDegLon = (sizeKm / 2) / (111 * Math.cos((lat * Math.PI) / 180));
-  return [lon - halfDegLon, lat - halfDegLat, lon + halfDegLon, lat + halfDegLat];
+function boundsCenter(bounds: [number, number, number, number]) {
+  const [w, s, e, n] = bounds;
+  return { lat: (s + n) / 2, lon: (w + e) / 2 };
+}
+
+function boundsSizeKm(bounds: [number, number, number, number]) {
+  const [w, s, e, n] = bounds;
+  const centerLat = (s + n) / 2;
+  const latKm = Math.abs(n - s) * 111;
+  const lonKm = Math.abs(e - w) * 111 * Math.cos((centerLat * Math.PI) / 180);
+  return Math.max(latKm, lonKm, 0);
+}
+
+function defaultBoundsAround(center: { lat: number; lon: number }, sizeKm: number): [number, number, number, number] {
+  const halfLat = (sizeKm / 2) / 111;
+  const halfLon = (sizeKm / 2) / (111 * Math.cos((center.lat * Math.PI) / 180));
+  return [center.lon - halfLon, center.lat - halfLat, center.lon + halfLon, center.lat + halfLat];
 }
 
 export default function Page() {
-  const [center, setCenter] = useState({ lat: 32.7157, lon: -117.1611 });
-  const [sizeKm, setSizeKm] = useState(10);
+  const [selectedSizeKm, setSelectedSizeKm] = useState(10);
   const [theme, setTheme] = useState<Theme>("true");
   const [palette, setPalette] = useState<Palette>("vivid");
   const [indexPack, setIndexPack] = useState<IndexPack>("veg");
@@ -43,14 +55,50 @@ export default function Page() {
   const [overlays, setOverlays] = useState<OverlayOptions>({ roads: false, buildings: false });
   const [basemapMode, setBasemapMode] = useState<"imagery" | "vector">("imagery");
   const [preview, setPreview] = useState<PreviewState>({});
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
   const [showSelection, setShowSelection] = useState(true);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [mapBounds, setMapBounds] = useState<[number, number, number, number] | null>(null);
+  const [aoiBounds, setAoiBounds] = useState<[number, number, number, number] | null>(null);
+  const [flyToTarget, setFlyToTarget] = useState<{ lat: number; lon: number; token: number } | null>(null);
+  const [sizeCommand, setSizeCommand] = useState<number | null>(null);
+  const [drawCommand, setDrawCommand] = useState<number>(0);
+  const [clearCommand, setClearCommand] = useState<number>(0);
   const previewClickRef = useRef<NodeJS.Timeout | null>(null);
+  const handleClearPreview = useCallback(() => {
+    setPreviewImageUrl(null);
+  }, []);
+  const triggerSizeCommand = (value: number) => {
+    setPreviewImageUrl(null);
+    setAoiBounds(null);
+    setClearCommand((c) => c + 1);
+    setSizeCommand(value);
+  };
+  useEffect(() => {
+    console.log("[page.tsx] AOI bounds updated:", aoiBounds);
+  }, [aoiBounds]);
 
-  const bbox = useMemo(() => preview.bbox ?? bboxFromCenter(center.lat, center.lon, sizeKm), [preview.bbox, center, sizeKm]);
+  const effectiveBounds = useMemo(() => aoiBounds ?? mapBounds, [aoiBounds, mapBounds]);
+  const payloadCenter = useMemo(
+    () => (effectiveBounds ? boundsCenter(effectiveBounds) : { lat: 32.7157, lon: -117.1611 }),
+    [effectiveBounds],
+  );
+  const payloadSizeKm = useMemo(
+    () => (effectiveBounds ? boundsSizeKm(effectiveBounds) : selectedSizeKm),
+    [effectiveBounds, selectedSizeKm],
+  );
+  const bbox = useMemo(
+    () =>
+      mapBounds ?? [
+        payloadCenter.lon - 0.05,
+        payloadCenter.lat - 0.05,
+        payloadCenter.lon + 0.05,
+        payloadCenter.lat + 0.05,
+      ],
+    [mapBounds, payloadCenter],
+  );
 
   const paletteEnabled = paletteAwareThemes.includes(theme);
   const overlayStyles = useMemo(
@@ -73,9 +121,9 @@ export default function Page() {
     [bgMode, bgColor],
   );
   const payload = {
-    lat: center.lat,
-    lon: center.lon,
-    size_km: sizeKm,
+    lat: payloadCenter.lat,
+    lon: payloadCenter.lon,
+    size_km: payloadSizeKm,
     theme,
     overlays,
     palette: paletteEnabled ? palette : undefined,
@@ -98,8 +146,15 @@ export default function Page() {
     setLoading(true);
     setMessage(null);
     try {
-      const result = await fetchPreview(payload);
+      console.log("[page.tsx] Sending preview request with AOI bounds:", aoiBounds);
+      if (!aoiBounds) {
+        throw new Error("Missing AOI bounds during preview request");
+      }
+      const result = await fetchPreview({ ...payload, aoi_bounds: aoiBounds });
       setPreview({ image: result.png_base64, bbox: result.bbox, scene: result.scene_metadata });
+      if (result.png_base64) {
+        setPreviewImageUrl(`data:image/png;base64,${result.png_base64}`);
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Preview failed");
     } finally {
@@ -108,6 +163,11 @@ export default function Page() {
   };
 
   const handlePreviewClick = () => {
+    console.log("[page.tsx] Preview button clicked. Current AOI bounds:", aoiBounds);
+    if (!aoiBounds) {
+      setMessage("Draw an AOI first.");
+      return;
+    }
     if (previewClickRef.current) {
       clearTimeout(previewClickRef.current);
     }
@@ -121,7 +181,7 @@ export default function Page() {
     setExporting(true);
     setMessage("Rendering export…");
     try {
-      const preferredBounds = preview.bbox ?? mapBounds ?? bboxFromCenter(center.lat, center.lon, sizeKm);
+      const preferredBounds = effectiveBounds ?? bbox ?? defaultBoundsAround(payloadCenter, selectedSizeKm);
       const exportCenterLat = (preferredBounds[1] + preferredBounds[3]) / 2;
       const exportCenterLon = (preferredBounds[0] + preferredBounds[2]) / 2;
       const latKm = Math.abs(preferredBounds[3] - preferredBounds[1]) * 111;
@@ -162,8 +222,10 @@ export default function Page() {
         <p className="subtitle">Select a place, pick a spectral theme, and create artful remote sensing exports.</p>
         <SearchBar
           onSelect={(lat, lon, label) => {
-            setCenter({ lat, lon });
+            setFlyToTarget({ lat, lon, token: Date.now() });
             setPreview({});
+            setPreviewImageUrl(null);
+            setAoiBounds(null);
             setMessage(`Focused on ${label}`);
           }}
         />
@@ -171,12 +233,64 @@ export default function Page() {
           <p>Area size (km)</p>
           <div className="preset-group">
             {sizePresets.map((option) => (
-              <button key={option} className={option === sizeKm ? "active" : ""} onClick={() => setSizeKm(option)}>
+              <button
+                key={option}
+                className={Math.round(option) === Math.round(selectedSizeKm) ? "active" : ""}
+                onClick={() => {
+                  setSelectedSizeKm(option);
+                  triggerSizeCommand(option);
+                }}
+              >
                 {option} km
               </button>
             ))}
           </div>
+          <label className="size-freeform">
+            Custom
+            <input
+              type="range"
+              min={1}
+              max={500}
+              step={1}
+              value={selectedSizeKm}
+              onChange={(e) => setSelectedSizeKm(Number(e.target.value))}
+              onMouseUp={(e) => {
+                const nextValue = Number(e.currentTarget.value);
+                setSelectedSizeKm(nextValue);
+                triggerSizeCommand(nextValue);
+              }}
+              onTouchEnd={(e) => {
+                const target = e.currentTarget as HTMLInputElement;
+                const nextValue = Number(target.value);
+                setSelectedSizeKm(nextValue);
+                triggerSizeCommand(nextValue);
+              }}
+            />
+            <input
+              type="number"
+              min={1}
+              max={50}
+              step={1}
+              value={selectedSizeKm}
+              onChange={(e) => setSelectedSizeKm(Number(e.target.value))}
+              onBlur={(e) => {
+                const nextValue = Number(e.target.value);
+                setSelectedSizeKm(nextValue);
+                triggerSizeCommand(nextValue);
+              }}
+            />
+            km
+          </label>
         </div>
+        <button
+          onClick={() => {
+            setPreviewImageUrl(null);
+            setAoiBounds(null);
+            setDrawCommand((c) => c + 1);
+          }}
+        >
+          Draw AOI
+        </button>
         <ThemePicker
           theme={theme}
           onChange={(next) => {
@@ -317,17 +431,24 @@ export default function Page() {
           </button>
         </div>
         {message && <p className="hint">{message}</p>}
+        <pre className="debug-aoi">AOI bounds: {aoiBounds ? JSON.stringify(aoiBounds) : "null"}</pre>
       </section>
       <section className="preview-section">
         <PreviewPane
-          center={center}
-          bbox={bbox}
-          previewBase64={preview.image}
+          selectedSizeKm={selectedSizeKm}
+          sizeCommand={sizeCommand}
+          drawCommand={drawCommand}
+          clearCommand={clearCommand}
+          flyToTarget={flyToTarget}
+          previewImageUrl={previewImageUrl}
           loading={loading}
           sceneInfo={preview.scene}
           showSelection={showSelection}
           basemap={basemapMode}
           onBoundsChange={setMapBounds}
+          onAoiBoundsChange={setAoiBounds}
+          onClearPreview={handleClearPreview}
+          onSizeCommandHandled={() => setSizeCommand(null)}
         />
       </section>
       <style jsx>{`
@@ -373,6 +494,24 @@ export default function Page() {
         .preset-group button.active {
           background: #2563eb;
           border-color: #2563eb;
+        }
+        .size-freeform {
+          display: flex;
+          align-items: center;
+          gap: 0.4rem;
+          font-size: 0.9rem;
+          margin-top: 0.35rem;
+        }
+        .size-freeform input[type='number'] {
+          width: 72px;
+          padding: 0.25rem;
+          border-radius: 6px;
+          border: 1px solid #1f2937;
+          background: rgba(0, 0, 0, 0.2);
+          color: #fff;
+        }
+        .size-freeform input[type='range'] {
+          flex: 1;
         }
         .selection-toggle {
           display: flex;
@@ -446,6 +585,11 @@ export default function Page() {
         }
         .hint {
           color: #fda4af;
+        }
+        .debug-aoi {
+          font-size: 0.7rem;
+          color: #94a3b8;
+          word-break: break-all;
         }
         @media (max-width: 1024px) {
           .page {
