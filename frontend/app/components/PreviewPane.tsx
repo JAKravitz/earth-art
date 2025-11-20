@@ -90,6 +90,7 @@ export default function PreviewPane({
   const [viewState, setViewState] = useState<ViewState>(DEFAULT_VIEW);
   const viewStateRef = useRef<ViewState>(DEFAULT_VIEW);
   const aoiRectRef = useRef<AoiRect | null>(null);
+  const latestBoundsRef = useRef<AoiBounds | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [aoiRect, setAoiRect] = useState<AoiRect | null>(null);
@@ -111,6 +112,7 @@ export default function PreviewPane({
   const pushBounds = useCallback(
     (bounds: AoiBounds | null) => {
       setLatestBounds(bounds);
+      latestBoundsRef.current = bounds;
       if (onAoiBoundsChange) {
         onAoiBoundsChange(bounds ? [bounds.west, bounds.south, bounds.east, bounds.north] : null);
       }
@@ -145,6 +147,36 @@ export default function PreviewPane({
     [],
   );
 
+  const projectBoundsToRect = useCallback(
+    (bounds: AoiBounds | null): AoiRect | null => {
+      const map = mapRef.current;
+      if (!bounds || !map) return null;
+      const topLeft = map.project([bounds.west, bounds.north]);
+      const bottomRight = map.project([bounds.east, bounds.south]);
+      const x = Math.min(topLeft.x, bottomRight.x);
+      const y = Math.min(topLeft.y, bottomRight.y);
+      const width = Math.abs(bottomRight.x - topLeft.x);
+      const height = Math.abs(bottomRight.y - topLeft.y);
+      if (width <= 0 || height <= 0) return null;
+      return { x, y, width, height };
+    },
+    [],
+  );
+
+  const syncAoiOverlayToBounds = useCallback(() => {
+    if (isDrawing || isDragging) return;
+    const bounds = latestBoundsRef.current;
+    if (!bounds) return;
+    const rect = projectBoundsToRect(bounds);
+    if (!rect) return;
+    setAoiRect((prev) => {
+      if (prev && prev.x === rect.x && prev.y === rect.y && prev.width === rect.width && prev.height === rect.height) {
+        return prev;
+      }
+      return rect;
+    });
+  }, [isDragging, isDrawing, projectBoundsToRect]);
+
 
   const syncViewFromMap = useCallback(() => {
     const map = mapRef.current;
@@ -161,8 +193,9 @@ export default function PreviewPane({
       const zoom = evt.target.getZoom();
       setViewState({ latitude: lat, longitude: lng, zoom });
       viewStateRef.current = { latitude: lat, longitude: lng, zoom };
+      syncAoiOverlayToBounds();
     },
-    [],
+    [syncAoiOverlayToBounds],
   );
 
   useEffect(() => {
@@ -270,6 +303,21 @@ export default function PreviewPane({
     applyPreviewLayer();
   }, [applyPreviewLayer, latestBounds, previewImageUrl, removePreviewLayer]);
 
+  useEffect(() => {
+    syncAoiOverlayToBounds();
+  }, [latestBounds, syncAoiOverlayToBounds]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    map.on("move", syncAoiOverlayToBounds);
+    map.on("resize", syncAoiOverlayToBounds);
+    return () => {
+      map.off("move", syncAoiOverlayToBounds);
+      map.off("resize", syncAoiOverlayToBounds);
+    };
+  }, [syncAoiOverlayToBounds]);
+
 
   useEffect(() => {
     applyFlyTo();
@@ -348,8 +396,12 @@ export default function PreviewPane({
     };
     console.log("[PreviewPane] finalizeAoi computed bounds:", bounds);
     pushBounds(bounds);
+    const projectedRect = projectBoundsToRect(bounds);
+    if (projectedRect) {
+      setAoiRect(projectedRect);
+    }
     dragStartRef.current = null;
-  }, [clearAoi, pushBounds, toggleMapInteractions]);
+  }, [clearAoi, projectBoundsToRect, pushBounds, toggleMapInteractions]);
 
   const handleOverlayMouseDown = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
