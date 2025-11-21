@@ -441,6 +441,7 @@ export default function Page() {
           clearCommand={clearCommand}
           flyToTarget={flyToTarget}
           previewImageUrl={previewImageUrl}
+          previewBounds={previewImageUrl ? preview.bbox ?? null : null}
           loading={loading}
           sceneInfo={preview.scene}
           showSelection={showSelection}

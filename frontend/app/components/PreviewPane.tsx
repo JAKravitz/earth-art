@@ -17,6 +17,7 @@ interface Props {
   clearCommand: number;
   flyToTarget?: { lat: number; lon: number; token: number } | null;
   previewImageUrl?: string | null;
+  previewBounds?: [number, number, number, number] | null;
   loading: boolean;
   sceneInfo?: Record<string, unknown>;
   showSelection: boolean;
@@ -74,6 +75,7 @@ export default function PreviewPane({
   clearCommand,
   flyToTarget,
   previewImageUrl,
+  previewBounds,
   loading,
   sceneInfo,
   showSelection,
@@ -97,6 +99,14 @@ export default function PreviewPane({
   const [latestBounds, setLatestBounds] = useState<AoiBounds | null>(null);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const flyTokenRef = useRef<number | null>(null);
+
+  const previewBoundsObj = useMemo(() => {
+    if (!previewBounds) return null;
+    const [west, south, east, north] = previewBounds;
+    return { west, south, east, north };
+  }, [previewBounds]);
+
+  const activeBounds = useMemo(() => previewBoundsObj ?? latestBounds, [latestBounds, previewBoundsObj]);
 
   const removePreviewLayer = useCallback(() => {
     const map = mapRef.current;
@@ -165,7 +175,7 @@ export default function PreviewPane({
 
   const syncAoiOverlayToBounds = useCallback(() => {
     if (isDrawing || isDragging) return;
-    const bounds = latestBoundsRef.current;
+    const bounds = activeBounds ?? latestBoundsRef.current;
     if (!bounds) return;
     const rect = projectBoundsToRect(bounds);
     if (!rect) return;
@@ -175,7 +185,7 @@ export default function PreviewPane({
       }
       return rect;
     });
-  }, [isDragging, isDrawing, projectBoundsToRect]);
+  }, [activeBounds, isDragging, isDrawing, projectBoundsToRect]);
 
 
   const syncViewFromMap = useCallback(() => {
@@ -206,17 +216,32 @@ export default function PreviewPane({
     aoiRectRef.current = aoiRect;
   }, [aoiRect]);
 
+  useEffect(() => {
+    latestBoundsRef.current = activeBounds ?? null;
+    syncAoiOverlayToBounds();
+  }, [activeBounds, syncAoiOverlayToBounds]);
+
+  const ensureZoomEnabled = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    map.scrollZoom.enable();
+    map.doubleClickZoom.enable();
+    map.touchZoomRotate.enable();
+    map.boxZoom.enable();
+  }, []);
+
   const applyFlyTo = useCallback(() => {
     if (!mapRef.current || !flyToTarget) return;
     const map = mapRef.current;
     flyTokenRef.current = flyToTarget.token;
     setViewState((prev) => ({ ...prev, latitude: flyToTarget.lat, longitude: flyToTarget.lon }));
+    ensureZoomEnabled();
     map.easeTo({
       center: [flyToTarget.lon, flyToTarget.lat],
       zoom: viewState.zoom,
       duration: 0,
     });
-  }, [flyToTarget, viewState.zoom]);
+  }, [ensureZoomEnabled, flyToTarget, viewState.zoom]);
 
   useEffect(() => {
     if (!mapCanvasRef.current || mapRef.current) return;
@@ -260,12 +285,12 @@ export default function PreviewPane({
 
   const applyPreviewLayer = useCallback(() => {
     const map = mapRef.current;
-    if (!map || !previewImageUrl || !latestBounds) return;
+    if (!map || !previewImageUrl || !activeBounds) return;
     const coordinates: [number, number][] = [
-      [latestBounds.west, latestBounds.north],
-      [latestBounds.east, latestBounds.north],
-      [latestBounds.east, latestBounds.south],
-      [latestBounds.west, latestBounds.south],
+      [activeBounds.west, activeBounds.north],
+      [activeBounds.east, activeBounds.north],
+      [activeBounds.east, activeBounds.south],
+      [activeBounds.west, activeBounds.south],
     ];
     const existing = map.getSource(PREVIEW_SOURCE_ID) as MapImageSource | undefined;
     if (existing && existing.type === "image") {
@@ -284,12 +309,12 @@ export default function PreviewPane({
         paint: { "raster-opacity": 1 },
       });
     }
-  }, [latestBounds, previewImageUrl, removePreviewLayer]);
+  }, [activeBounds, previewImageUrl, removePreviewLayer]);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    if (!previewImageUrl || !latestBounds) {
+    if (!previewImageUrl || !activeBounds) {
       removePreviewLayer();
       return;
     }
@@ -301,7 +326,7 @@ export default function PreviewPane({
       };
     }
     applyPreviewLayer();
-  }, [applyPreviewLayer, latestBounds, previewImageUrl, removePreviewLayer]);
+  }, [activeBounds, applyPreviewLayer, previewImageUrl, removePreviewLayer]);
 
   useEffect(() => {
     syncAoiOverlayToBounds();
@@ -326,10 +351,19 @@ export default function PreviewPane({
   const toggleMapInteractions = useCallback((enable: boolean) => {
     const map = mapRef.current;
     if (!map) return;
-    const action = enable ? "enable" : "disable";
-    map.dragPan[action]();
-    map.scrollZoom[action]?.();
-    map.doubleClickZoom[action]?.();
+    if (enable) {
+      map.dragPan.enable();
+      map.scrollZoom.enable();
+      map.doubleClickZoom.enable();
+      map.touchZoomRotate.enable();
+      map.boxZoom.enable();
+    } else {
+      map.dragPan.disable();
+      map.scrollZoom.disable();
+      map.doubleClickZoom.disable();
+      map.touchZoomRotate.disable();
+      map.boxZoom.disable();
+    }
   }, []);
 
   useEffect(() => {
