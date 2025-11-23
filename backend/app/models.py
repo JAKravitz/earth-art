@@ -112,3 +112,45 @@ class PreviewResponse(BaseModel):
     png_base64: str
     bbox: List[float]
     scene_metadata: SceneMetadata
+
+
+FilterStyleLiteral = Literal["PCA", "MNF", "FalseColor", "DecorrelatedStretch", "UrbanOverlay", "Custom"]
+
+
+class FilterSpec(BaseModel):
+    id: str
+    styleType: FilterStyleLiteral
+    params: Dict[str, object] = Field(default_factory=dict)
+
+
+class BatchPreviewRequest(BaseModel):
+    lat: float = Field(..., ge=-90.0, le=90.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
+    size_km: float = Field(10.0, ge=1.0, le=100.0)
+    aoi_bounds: Optional[List[float]] = Field(default=None, description="Optional AOI bbox [w, s, e, n]")
+    themeId: Literal["earth-science", "urban"] = "earth-science"
+    filters: List[FilterSpec]
+    preview: bool = True
+    target_size_px: PositiveInt = Field(default=768, le=2048)
+    date_range: Optional[DateRange] = None
+
+
+class BatchPreviewItem(BaseModel):
+    id: str
+    png_base64: str
+    bbox: List[float]
+    scene_metadata: Optional[SceneMetadata] = None
+
+
+class BatchPreviewResponse(BaseModel):
+    results: List[BatchPreviewItem]
+
+
+class ExportFilterRequest(BaseModel):
+    lat: float = Field(..., ge=-90.0, le=90.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
+    size_km: float = Field(10.0, ge=1.0, le=100.0)
+    aoi_bounds: Optional[List[float]] = None
+    filter: FilterSpec
+    target_size_px: PositiveInt = Field(4096, le=8192)
+    watermark: Optional[str] = Field(default=None, max_length=64)

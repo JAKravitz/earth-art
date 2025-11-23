@@ -2,21 +2,35 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict
+import asyncio
+import atexit
+from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.models import ExportRequest, PreviewRequest, PreviewResponse, SceneMetadata
-from app.processing import compose, fetch, overlays, render
-from app.processing.fetch import (
-    SceneNotFoundError,
-    SceneSearchError,
-    SceneValidationError,
+from app.models import (
+    BatchPreviewItem,
+    BatchPreviewRequest,
+    BatchPreviewResponse,
+    ExportFilterRequest,
+    ExportRequest,
+    PreviewRequest,
+    PreviewResponse,
+    SceneMetadata,
 )
+from app.processing import compose, fetch, overlays, render
+from app.processing.fetch import SceneNotFoundError, SceneSearchError, SceneValidationError
+from app.processing.filters import render_filter
 
 LOGGER = logging.getLogger(__name__)
-PREVIEW_MAX_PX = int(os.getenv("PREVIEW_MAX_PX", "1024"))
+PREVIEW_MAX_PX = int(os.getenv("PREVIEW_MAX_PX", "512"))
+PREVIEW_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(4, min(8, os.cpu_count() or 4)),
+    thread_name_prefix="preview",
+)
+atexit.register(lambda: PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True))
 DEFAULT_GAMMA = {
     "true": 1.0,
     "truecolor": 1.0,
@@ -49,6 +63,11 @@ def _date_range(request: PreviewRequest) -> str | None:
     if request.date_range:
         return request.date_range.to_timerange()
     return None
+
+
+@app.on_event("shutdown")
+def _shutdown_executor() -> None:
+    PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 def _scene_metadata(selection: fetch.SceneSelection) -> SceneMetadata:
@@ -126,6 +145,102 @@ def export(request: ExportRequest) -> Response:
         image = render.add_watermark(image, request.watermark)
     raw, _ = render.encode_png(image)
     filename = f"earth-art-{selection.item.id}-{request.theme}.png"
+    return Response(
+        content=raw,
+        media_type="image/png",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+def _prepare_stack_for_filters(lat: float, lon: float, size_km: float, pixels: int, date_range: str | None):
+    return fetch.fetch_raster_stack(
+        lat,
+        lon,
+        size_km,
+        "pca",
+        pixels,
+        date_range=date_range,
+    )
+
+
+@app.post("/filters/preview", response_model=BatchPreviewResponse)
+def batch_preview(request: BatchPreviewRequest) -> BatchPreviewResponse:
+    try:
+        stack, selection, _ = _prepare_stack_for_filters(
+            request.lat,
+            request.lon,
+            request.size_km,
+            request.target_size_px,
+            date_range=_date_range(request),
+        )
+    except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    results: List[BatchPreviewItem] = []
+
+    def _render_one(spec):
+        rgb = render_filter(stack, selection, spec, preview_mode=True)
+        image = render.to_image(rgb, gamma=1.0, apply_stretch=False)
+        image = render.resize_image(image, min(request.target_size_px, PREVIEW_MAX_PX))
+        _, encoded = render.encode_png(image)
+        return BatchPreviewItem(
+            id=spec.id,
+            png_base64=encoded,
+            bbox=list(selection.bbox),
+            scene_metadata=_scene_metadata(selection),
+        )
+
+    futures = {PREVIEW_EXECUTOR.submit(_render_one, spec): spec.id for spec in request.filters}
+    completed: set[str] = set()
+    try:
+        for fut in as_completed(futures, timeout=20):
+            fid = futures[fut]
+            completed.add(fid)
+            results.append(fut.result())
+    except TimeoutError:
+        for fut in futures:
+            if not fut.done():
+                fut.cancel()
+        for fid in futures.values():
+            if fid in completed:
+                continue
+            solid = render.make_solid_canvas(32, 32, "#000000")
+            img = render.to_image(solid, apply_stretch=False)
+            _, encoded = render.encode_png(img)
+            results.append(
+                BatchPreviewItem(
+                    id=fid,
+                    png_base64=encoded,
+                    bbox=list(selection.bbox),
+                    scene_metadata=_scene_metadata(selection),
+                )
+            )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        raise
+    return BatchPreviewResponse(results=results)
+
+
+@app.post("/filters/export")
+def export_filter(request: ExportFilterRequest) -> Response:
+    try:
+        stack, selection, _ = _prepare_stack_for_filters(
+            request.lat,
+            request.lon,
+            request.size_km,
+            request.target_size_px,
+            date_range=_date_range(request),
+        )
+    except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    rgb = render_filter(stack, selection, request.filter, preview_mode=False)
+    image = render.to_image(rgb, gamma=1.0, apply_stretch=False)
+    image = render.scale_to_max(image, request.target_size_px)
+    if request.watermark:
+        image = render.add_watermark(image, request.watermark)
+    raw, _ = render.encode_png(image)
+    filename = f"earth-art-{request.filter.id}.png"
     return Response(
         content=raw,
         media_type="image/png",

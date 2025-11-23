@@ -198,9 +198,11 @@ export default function PreviewPane({
   }, []);
 
   const handleMapMove = useCallback(
-    (evt: maplibregl.MapboxEvent<MouseEvent | TouchEvent | WheelEvent> & maplibregl.EventData) => {
-      const { lat, lng } = evt.target.getCenter();
-      const zoom = evt.target.getZoom();
+    (_evt: maplibregl.MapMouseEvent) => {
+      const map = mapRef.current;
+      if (!map) return;
+      const { lat, lng } = map.getCenter();
+      const zoom = map.getZoom();
       setViewState({ latitude: lat, longitude: lng, zoom });
       viewStateRef.current = { latitude: lat, longitude: lng, zoom };
       syncAoiOverlayToBounds();
@@ -286,7 +288,7 @@ export default function PreviewPane({
   const applyPreviewLayer = useCallback(() => {
     const map = mapRef.current;
     if (!map || !previewImageUrl || !activeBounds) return;
-    const coordinates: [number, number][] = [
+    const coordinates: [[number, number], [number, number], [number, number], [number, number]] = [
       [activeBounds.west, activeBounds.north],
       [activeBounds.east, activeBounds.north],
       [activeBounds.east, activeBounds.south],
