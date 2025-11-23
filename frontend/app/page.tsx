@@ -12,6 +12,8 @@ import {
   ExportFilterRequest,
 } from "./api";
 import { FILTERS, THEMES, ThemeId, getFilterById, getFiltersForTheme } from "./config/themesAndFilters";
+import { getPresets, getPresetById, ProductPresetId } from "./config/aoiPresets";
+import { createAoiPolygonFromPreset, bboxFromFeature } from "./utils/aoiFromPreset";
 
 type FilterPreviewStatus = "idle" | "loading" | "ready" | "error";
 
@@ -24,8 +26,8 @@ type FilterPreview = {
 
 type PreviewState = Partial<Record<ThemeId, Record<string, FilterPreview>>>;
 
-const sizePresets = [5, 10, 20];
 const DEFAULT_THEME: ThemeId = "earth-science";
+const DEFAULT_PRESET: ProductPresetId = "square";
 
 function boundsCenter(bounds: [number, number, number, number]) {
   const [w, s, e, n] = bounds;
@@ -41,8 +43,8 @@ function boundsSizeKm(bounds: [number, number, number, number]) {
 }
 
 export default function Page() {
-  const [selectedSizeKm, setSelectedSizeKm] = useState(10);
   const [selectedThemeId, setSelectedThemeId] = useState<ThemeId>(DEFAULT_THEME);
+  const [selectedPresetId, setSelectedPresetId] = useState<ProductPresetId>(DEFAULT_PRESET);
   const [selectedFilterId, setSelectedFilterId] = useState<string>(
     getFiltersForTheme(DEFAULT_THEME)[0]?.id ?? FILTERS[0].id,
   );
@@ -55,24 +57,25 @@ export default function Page() {
   const [mapBounds, setMapBounds] = useState<[number, number, number, number] | null>(null);
   const [aoiBounds, setAoiBounds] = useState<[number, number, number, number] | null>(null);
   const [flyToTarget, setFlyToTarget] = useState<{ lat: number; lon: number; token: number } | null>(null);
-  const [sizeCommand, setSizeCommand] = useState<number | null>(null);
   const [drawCommand, setDrawCommand] = useState<number>(0);
   const [clearCommand, setClearCommand] = useState<number>(0);
   const [exporting, setExporting] = useState(false);
   const previewRequestRef = useRef<NodeJS.Timeout | null>(null);
+  const [customAoiMode, setCustomAoiMode] = useState(false);
 
   const currentFilters = useMemo(() => getFiltersForTheme(selectedThemeId), [selectedThemeId]);
-  const currentFilter = useMemo(() => getFilterById(selectedFilterId) ?? currentFilters[0], [currentFilters, selectedFilterId]);
+  const currentFilter = useMemo(
+    () => getFilterById(selectedFilterId) ?? currentFilters[0],
+    [currentFilters, selectedFilterId],
+  );
+  const currentPreset = useMemo(() => getPresetById(selectedPresetId), [selectedPresetId]);
 
   const effectiveBounds = useMemo(() => aoiBounds ?? mapBounds, [aoiBounds, mapBounds]);
   const payloadCenter = useMemo(
     () => (effectiveBounds ? boundsCenter(effectiveBounds) : { lat: 32.7157, lon: -117.1611 }),
     [effectiveBounds],
   );
-  const payloadSizeKm = useMemo(
-    () => (effectiveBounds ? boundsSizeKm(effectiveBounds) : selectedSizeKm),
-    [effectiveBounds, selectedSizeKm],
-  );
+  const payloadSizeKm = useMemo(() => (effectiveBounds ? boundsSizeKm(effectiveBounds) : 20), [effectiveBounds]);
 
   const resetCurrentPreview = useCallback(() => {
     setPreviewImageUrl(null);
@@ -102,6 +105,7 @@ export default function Page() {
         setSelectedFilterId(firstFilter.id);
         updatePreviewFromState(themeId, firstFilter.id);
       }
+      setCustomAoiMode(false);
     },
     [updatePreviewFromState],
   );
@@ -224,16 +228,10 @@ export default function Page() {
     }
   };
 
-  const triggerSizeCommand = (value: number) => {
-    setPreviewImageUrl(null);
-    setAoiBounds(null);
-    setClearCommand((c) => c + 1);
-    setSizeCommand(value);
-  };
-
   const triggerDraw = () => {
     setPreviewImageUrl(null);
     setAoiBounds(null);
+    setCustomAoiMode(true);
     setDrawCommand((c) => c + 1);
   };
 
@@ -279,6 +277,25 @@ export default function Page() {
   const anyLoading = loadingPreviews || !!currentFilters.find((f) => previewState[selectedThemeId]?.[f.id]?.status === "loading");
   const previewForFilter = previewState[selectedThemeId]?.[selectedFilterId];
 
+  const presets = useMemo(() => getPresets(), []);
+
+  const applyPresetAoi = useCallback(() => {
+    if (!currentPreset) return;
+    const center =
+      mapBounds && mapBounds.length === 4 ? boundsCenter(mapBounds) : payloadCenter ?? { lat: 32.7157, lon: -117.1611 };
+    const feature = createAoiPolygonFromPreset(currentPreset, selectedThemeId, center.lon, center.lat);
+    const bbox = bboxFromFeature(feature);
+    setAoiBounds(bbox);
+    setCustomAoiMode(false);
+  }, [currentPreset, mapBounds, payloadCenter, selectedThemeId]);
+
+  useEffect(() => {
+    if (customAoiMode) return;
+    if (currentPreset && payloadCenter) {
+      applyPresetAoi();
+    }
+  }, [applyPresetAoi, currentPreset, customAoiMode, payloadCenter]);
+
   return (
     <main className="page">
       <section className="controls">
@@ -292,62 +309,27 @@ export default function Page() {
             setAoiBounds(null);
           }}
         />
-        <div className="size-picker">
-          <p>Area size (km)</p>
-          <div className="preset-group">
-            {sizePresets.map((option) => (
+        <div className="preset-picker">
+          <p className="card-title">Choose your canvas</p>
+          <div className="preset-grid">
+            {presets.map((preset) => (
               <button
-                key={option}
-                className={Math.round(option) === Math.round(selectedSizeKm) ? "active" : ""}
+                key={preset.id}
+                className={`filter-card ${selectedPresetId === preset.id ? "active" : ""}`}
                 onClick={() => {
-                  setSelectedSizeKm(option);
-                  triggerSizeCommand(option);
+                  setSelectedPresetId(preset.id);
+                  setCustomAoiMode(false);
+                  applyPresetAoi();
                 }}
               >
-                {option} km
+                <div className="filter-header">
+                  <span className="filter-name">{preset.name}</span>
+                </div>
+                <p className="filter-description">{preset.description ?? ""}</p>
               </button>
             ))}
           </div>
-          <label className="size-freeform">
-            Custom
-            <input
-              type="range"
-              min={1}
-              max={500}
-              step={1}
-              value={selectedSizeKm}
-              onChange={(e) => setSelectedSizeKm(Number(e.target.value))}
-              onMouseUp={(e) => {
-                const nextValue = Number(e.currentTarget.value);
-                setSelectedSizeKm(nextValue);
-                triggerSizeCommand(nextValue);
-              }}
-              onTouchEnd={(e) => {
-                const target = e.currentTarget as HTMLInputElement;
-                const nextValue = Number(target.value);
-                setSelectedSizeKm(nextValue);
-                triggerSizeCommand(nextValue);
-              }}
-            />
-            <input
-              type="number"
-              min={1}
-              max={50}
-              step={1}
-              value={selectedSizeKm}
-              onChange={(e) => setSelectedSizeKm(Number(e.target.value))}
-              onBlur={(e) => {
-                const nextValue = Number(e.target.value);
-                setSelectedSizeKm(nextValue);
-                triggerSizeCommand(nextValue);
-              }}
-            />
-            km
-          </label>
-        </div>
-        <div className="actions-row">
-          <button onClick={triggerDraw}>Draw AOI</button>
-          <button onClick={() => setClearCommand((c) => c + 1)}>Clear</button>
+          <p className="hint">We keep a wider view so the artwork looks smooth and detailed in print.</p>
         </div>
         <div className="theme-switcher">
           {THEMES.map((theme) => (
@@ -391,18 +373,27 @@ export default function Page() {
             {exporting ? "Exporting…" : "Export 4K"}
           </button>
         </div>
+        <details className="advanced">
+          <summary>Advanced</summary>
+          <p className="hint">Custom AOI draw (experimental). Too-small AOIs may look coarse.</p>
+          <div className="actions-row">
+            <button onClick={triggerDraw}>Custom AOI (draw)</button>
+            <button onClick={() => setClearCommand((c) => c + 1)}>Clear</button>
+          </div>
+        </details>
         {message && <p className="hint">{message}</p>}
         <pre className="debug-aoi">AOI bounds: {aoiBounds ? JSON.stringify(aoiBounds) : "null"}</pre>
       </section>
       <section className="preview-section">
         <PreviewPane
-          selectedSizeKm={selectedSizeKm}
-          sizeCommand={sizeCommand}
+          selectedSizeKm={payloadSizeKm}
+          sizeCommand={null}
           drawCommand={drawCommand}
           clearCommand={clearCommand}
           flyToTarget={flyToTarget}
           previewImageUrl={previewImageUrl}
           previewBounds={previewBounds}
+          presetBounds={aoiBounds}
           loading={anyLoading}
           sceneInfo={sceneInfo}
           showSelection={true}
@@ -410,7 +401,7 @@ export default function Page() {
           onBoundsChange={setMapBounds}
           onAoiBoundsChange={setAoiBounds}
           onClearPreview={resetCurrentPreview}
-          onSizeCommandHandled={() => setSizeCommand(null)}
+          onSizeCommandHandled={() => null}
         />
       </section>
       <style jsx>{`

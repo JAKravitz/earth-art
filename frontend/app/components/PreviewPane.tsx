@@ -18,6 +18,7 @@ interface Props {
   flyToTarget?: { lat: number; lon: number; token: number } | null;
   previewImageUrl?: string | null;
   previewBounds?: [number, number, number, number] | null;
+  presetBounds?: [number, number, number, number] | null;
   loading: boolean;
   sceneInfo?: Record<string, unknown>;
   showSelection: boolean;
@@ -76,6 +77,7 @@ export default function PreviewPane({
   flyToTarget,
   previewImageUrl,
   previewBounds,
+  presetBounds,
   loading,
   sceneInfo,
   showSelection,
@@ -106,7 +108,16 @@ export default function PreviewPane({
     return { west, south, east, north };
   }, [previewBounds]);
 
-  const activeBounds = useMemo(() => previewBoundsObj ?? latestBounds, [latestBounds, previewBoundsObj]);
+  const presetBoundsObj = useMemo(() => {
+    if (!presetBounds) return null;
+    const [west, south, east, north] = presetBounds;
+    return { west, south, east, north };
+  }, [presetBounds]);
+
+  const activeBounds = useMemo(
+    () => previewBoundsObj ?? presetBoundsObj ?? latestBounds,
+    [latestBounds, presetBoundsObj, previewBoundsObj],
+  );
 
   const removePreviewLayer = useCallback(() => {
     const map = mapRef.current;
@@ -222,6 +233,16 @@ export default function PreviewPane({
     latestBoundsRef.current = activeBounds ?? null;
     syncAoiOverlayToBounds();
   }, [activeBounds, syncAoiOverlayToBounds]);
+
+  useEffect(() => {
+    if (!presetBoundsObj) return;
+    latestBoundsRef.current = presetBoundsObj;
+    setLatestBounds(presetBoundsObj);
+    const rect = projectBoundsToRect(presetBoundsObj);
+    if (rect) {
+      setAoiRect(rect);
+    }
+  }, [presetBoundsObj, projectBoundsToRect]);
 
   const ensureZoomEnabled = useCallback(() => {
     const map = mapRef.current;

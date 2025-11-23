@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import asyncio
-import atexit
 from typing import Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
@@ -30,7 +29,6 @@ PREVIEW_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(4, min(8, os.cpu_count() or 4)),
     thread_name_prefix="preview",
 )
-atexit.register(lambda: PREVIEW_EXECUTOR.shutdown(wait=False, cancel_futures=True))
 DEFAULT_GAMMA = {
     "true": 1.0,
     "truecolor": 1.0,
