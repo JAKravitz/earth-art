@@ -141,6 +141,7 @@ def _get_palette_matrix(name: str = "vivid") -> np.ndarray:
         "cool": np.array([[0.0, 0.8, 1.0], [0.4, 0.1, 0.7], [0.1, 0.4, 1.0]], dtype="float32"),
         "warm": np.array([[1.0, 0.6, 0.1], [1.0, 0.2, 0.0], [0.8, 0.3, 0.0]], dtype="float32"),
         "neutral": np.eye(3, dtype="float32"),
+        "neon": np.array([[0.2, 1.0, 1.0], [1.0, 0.2, 0.8], [0.2, 0.4, 1.0]], dtype="float32"),
         "random": rng.uniform(0.1, 1.0, (3, 3)).astype("float32"),
     }
     return presets.get(name, presets["vivid"])
@@ -318,7 +319,7 @@ def compose_pca(stack: xr.DataArray, palette: str = "vivid") -> np.ndarray:
             ),
         )
     valid = _valid_mask(arr)
-    max_samples = int(os.getenv("EA_PCA_SAMPLES", "250000"))
+    max_samples = int(os.getenv("EA_PCA_SAMPLES", "20000"))
     samples = _sample_pixels(arr, valid, max_samples=max_samples, seed=0)
 
     if samples is None or samples.shape[0] < 5000:

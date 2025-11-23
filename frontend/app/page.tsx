@@ -2,22 +2,32 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { exportImage, fetchPreview, IndexPack, OverlayOptions, Palette, Theme } from "./api";
-import OverlayToggles from "./components/OverlayToggles";
-import PalettePicker from "./components/PalettePicker";
 import PreviewPane from "./components/PreviewPane";
 import SearchBar from "./components/SearchBar";
-import IndexPackPicker from "./components/IndexPackPicker";
-import ThemePicker from "./components/ThemePicker";
+import {
+  fetchBatchPreviews,
+  exportFilterImage,
+  BatchPreviewItem,
+  BatchPreviewRequest,
+  ExportFilterRequest,
+} from "./api";
+import { FILTERS, THEMES, ThemeId, getFilterById, getFiltersForTheme } from "./config/themesAndFilters";
+import { getPresets, getPresetById, ProductPresetId } from "./config/aoiPresets";
+import { createAoiPolygonFromPreset, bboxFromFeature } from "./utils/aoiFromPreset";
 
-const sizePresets = [5, 10, 20];
-const paletteAwareThemes: Theme[] = ["pca", "decorr", "nmf", "index_triplet"];
+type FilterPreviewStatus = "idle" | "loading" | "ready" | "error";
 
-type PreviewState = {
-  image?: string;
+type FilterPreview = {
+  status: FilterPreviewStatus;
+  imageUrl?: string;
   bbox?: [number, number, number, number];
   scene?: Record<string, unknown>;
 };
+
+type PreviewState = Partial<Record<ThemeId, Record<string, FilterPreview>>>;
+
+const DEFAULT_THEME: ThemeId = "earth-science";
+const DEFAULT_PRESET: ProductPresetId = "square";
 
 function boundsCenter(bounds: [number, number, number, number]) {
   const [w, s, e, n] = bounds;
@@ -32,179 +42,228 @@ function boundsSizeKm(bounds: [number, number, number, number]) {
   return Math.max(latKm, lonKm, 0);
 }
 
-function defaultBoundsAround(center: { lat: number; lon: number }, sizeKm: number): [number, number, number, number] {
-  const halfLat = (sizeKm / 2) / 111;
-  const halfLon = (sizeKm / 2) / (111 * Math.cos((center.lat * Math.PI) / 180));
-  return [center.lon - halfLon, center.lat - halfLat, center.lon + halfLon, center.lat + halfLat];
-}
-
 export default function Page() {
-  const [selectedSizeKm, setSelectedSizeKm] = useState(10);
-  const [theme, setTheme] = useState<Theme>("true");
-  const [palette, setPalette] = useState<Palette>("vivid");
-  const [indexPack, setIndexPack] = useState<IndexPack>("veg");
-  const [roadColor, setRoadColor] = useState("#00ffff");
-  const [roadWidth, setRoadWidth] = useState(2);
-  const [roadOpacity, setRoadOpacity] = useState(1);
-  const [buildingColor, setBuildingColor] = useState("#ff00ff");
-  const [buildingOutline, setBuildingOutline] = useState(1);
-  const [buildingFillOpacity, setBuildingFillOpacity] = useState(0.15);
-  const [buildingOpacity, setBuildingOpacity] = useState(0.8);
-  const [bgMode, setBgMode] = useState<"imagery" | "solid">("imagery");
-  const [bgColor, setBgColor] = useState("#0e0e10");
-  const [overlays, setOverlays] = useState<OverlayOptions>({ roads: false, buildings: false });
-  const [basemapMode, setBasemapMode] = useState<"imagery" | "vector">("imagery");
-  const [preview, setPreview] = useState<PreviewState>({});
+  const [selectedThemeId, setSelectedThemeId] = useState<ThemeId>(DEFAULT_THEME);
+  const [selectedPresetId, setSelectedPresetId] = useState<ProductPresetId>(DEFAULT_PRESET);
+  const [selectedFilterId, setSelectedFilterId] = useState<string>(
+    getFiltersForTheme(DEFAULT_THEME)[0]?.id ?? FILTERS[0].id,
+  );
+  const [previewState, setPreviewState] = useState<PreviewState>({});
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
-  const [showSelection, setShowSelection] = useState(true);
-  const [loading, setLoading] = useState(false);
-  const [exporting, setExporting] = useState(false);
+  const [previewBounds, setPreviewBounds] = useState<[number, number, number, number] | null>(null);
+  const [sceneInfo, setSceneInfo] = useState<Record<string, unknown> | undefined>(undefined);
+  const [loadingPreviews, setLoadingPreviews] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [mapBounds, setMapBounds] = useState<[number, number, number, number] | null>(null);
   const [aoiBounds, setAoiBounds] = useState<[number, number, number, number] | null>(null);
   const [flyToTarget, setFlyToTarget] = useState<{ lat: number; lon: number; token: number } | null>(null);
-  const [sizeCommand, setSizeCommand] = useState<number | null>(null);
   const [drawCommand, setDrawCommand] = useState<number>(0);
   const [clearCommand, setClearCommand] = useState<number>(0);
-  const previewClickRef = useRef<NodeJS.Timeout | null>(null);
-  const handleClearPreview = useCallback(() => {
-    setPreviewImageUrl(null);
-  }, []);
-  const triggerSizeCommand = (value: number) => {
-    setPreviewImageUrl(null);
-    setAoiBounds(null);
-    setClearCommand((c) => c + 1);
-    setSizeCommand(value);
-  };
-  useEffect(() => {
-    console.log("[page.tsx] AOI bounds updated:", aoiBounds);
-  }, [aoiBounds]);
+  const [exporting, setExporting] = useState(false);
+  const previewRequestRef = useRef<NodeJS.Timeout | null>(null);
+  const [customAoiMode, setCustomAoiMode] = useState(false);
+
+  const currentFilters = useMemo(() => getFiltersForTheme(selectedThemeId), [selectedThemeId]);
+  const currentFilter = useMemo(
+    () => getFilterById(selectedFilterId) ?? currentFilters[0],
+    [currentFilters, selectedFilterId],
+  );
+  const currentPreset = useMemo(() => getPresetById(selectedPresetId), [selectedPresetId]);
 
   const effectiveBounds = useMemo(() => aoiBounds ?? mapBounds, [aoiBounds, mapBounds]);
   const payloadCenter = useMemo(
     () => (effectiveBounds ? boundsCenter(effectiveBounds) : { lat: 32.7157, lon: -117.1611 }),
     [effectiveBounds],
   );
-  const payloadSizeKm = useMemo(
-    () => (effectiveBounds ? boundsSizeKm(effectiveBounds) : selectedSizeKm),
-    [effectiveBounds, selectedSizeKm],
-  );
-  const bbox = useMemo(
-    () =>
-      mapBounds ?? [
-        payloadCenter.lon - 0.05,
-        payloadCenter.lat - 0.05,
-        payloadCenter.lon + 0.05,
-        payloadCenter.lat + 0.05,
-      ],
-    [mapBounds, payloadCenter],
-  );
+  const payloadSizeKm = useMemo(() => (effectiveBounds ? boundsSizeKm(effectiveBounds) : 20), [effectiveBounds]);
 
-  const paletteEnabled = paletteAwareThemes.includes(theme);
-  const overlayStyles = useMemo(
-    () => ({
-      roads: { color: roadColor, width: roadWidth, opacity: roadOpacity },
-      buildings: {
-        color: buildingColor,
-        width: buildingOutline,
-        opacity: buildingOpacity,
-        fill_opacity: buildingFillOpacity,
-      },
-    }),
-    [roadColor, roadWidth, roadOpacity, buildingColor, buildingOutline, buildingOpacity, buildingFillOpacity],
-  );
-  const backgroundConfig = useMemo(
-    () => ({
-      mode: bgMode,
-      color: bgColor,
-    }),
-    [bgMode, bgColor],
-  );
-  const payload = {
-    lat: payloadCenter.lat,
-    lon: payloadCenter.lon,
-    size_km: payloadSizeKm,
-    theme,
-    overlays,
-    palette: paletteEnabled ? palette : undefined,
-    pcaScheme: paletteEnabled ? palette : undefined,
-    indexPack: theme === "index_triplet" ? indexPack : undefined,
-    overlayStyles,
-    background: backgroundConfig,
-  };
+  const resetCurrentPreview = useCallback(() => {
+    setPreviewImageUrl(null);
+    setPreviewBounds(null);
+    setSceneInfo(undefined);
+  }, []);
 
-  useEffect(
-    () => () => {
-      if (previewClickRef.current) {
-        clearTimeout(previewClickRef.current);
+  const updatePreviewFromState = useCallback(
+    (themeId: ThemeId, filterId: string) => {
+      const entry = previewState[themeId]?.[filterId];
+      if (entry?.status === "ready" && entry.imageUrl) {
+        setPreviewImageUrl(entry.imageUrl);
+        setPreviewBounds(entry.bbox ?? null);
+        setSceneInfo(entry.scene);
+      } else {
+        resetCurrentPreview();
       }
+    },
+    [previewState, resetCurrentPreview],
+  );
+
+  const setThemeAndFilter = useCallback(
+    (themeId: ThemeId) => {
+      const firstFilter = getFiltersForTheme(themeId)[0];
+      setSelectedThemeId(themeId);
+      if (firstFilter) {
+        setSelectedFilterId(firstFilter.id);
+        updatePreviewFromState(themeId, firstFilter.id);
+      }
+      setCustomAoiMode(false);
+    },
+    [updatePreviewFromState],
+  );
+
+  const markFiltersLoading = useCallback(
+    (themeId: ThemeId) => {
+      const filters = getFiltersForTheme(themeId);
+      setPreviewState((prev) => {
+        const next = { ...prev };
+        const themeEntry: Record<string, FilterPreview> = {};
+        filters.forEach((f) => {
+          themeEntry[f.id] = { status: "loading" };
+        });
+        next[themeId] = { ...(next[themeId] || {}), ...themeEntry };
+        return next;
+      });
     },
     [],
   );
 
-  const runPreview = async () => {
-    setLoading(true);
-    setMessage(null);
-    try {
-      console.log("[page.tsx] Sending preview request with AOI bounds:", aoiBounds);
-      if (!aoiBounds) {
-        throw new Error("Missing AOI bounds during preview request");
+  const applyBatchResults = useCallback((themeId: ThemeId, results: BatchPreviewItem[]) => {
+    const resultMap = new Map(results.map((r) => [r.id, r]));
+    setPreviewState((prev) => {
+      const next = { ...prev };
+      const existing = { ...(next[themeId] || {}) };
+      const filters = getFiltersForTheme(themeId);
+      filters.forEach((f) => {
+        const res = resultMap.get(f.id);
+        if (res) {
+          existing[f.id] = {
+            status: "ready",
+            imageUrl: `data:image/png;base64,${res.png_base64}`,
+            bbox: res.bbox,
+            scene: res.scene_metadata,
+          };
+        } else {
+          existing[f.id] = existing[f.id] && existing[f.id].status === "ready" ? existing[f.id] : { status: "error" };
+        }
+      });
+      next[themeId] = existing;
+      return next;
+    });
+    const preferred = currentFilter && resultMap.has(currentFilter.id) ? currentFilter.id : results[0]?.id;
+    if (preferred) {
+      setSelectedFilterId(preferred);
+      const matched = resultMap.get(preferred);
+      setPreviewImageUrl(matched ? `data:image/png;base64,${matched.png_base64}` : null);
+      setPreviewBounds(matched?.bbox ?? null);
+      setSceneInfo(matched?.scene_metadata);
+    }
+  }, [currentFilter]);
+
+  const triggerBatchPreview = useCallback(
+    async (themeId: ThemeId) => {
+      if (!aoiBounds) return;
+      const filters = getFiltersForTheme(themeId);
+      if (!filters.length) return;
+      setLoadingPreviews(true);
+      resetCurrentPreview();
+      markFiltersLoading(themeId);
+      const payload: BatchPreviewRequest = {
+        lat: payloadCenter.lat,
+        lon: payloadCenter.lon,
+        size_km: payloadSizeKm,
+        aoi_bounds: aoiBounds,
+        themeId,
+        preview: true,
+        target_size_px: 320,
+        filters: filters.map((f) => ({
+          id: f.id,
+          styleType: f.styleType,
+          params: f.params,
+        })),
+      };
+      try {
+        const res = await fetchBatchPreviews(payload);
+        applyBatchResults(themeId, res.results);
+        setMessage(res.results.length === 0 ? "No previews generated" : null);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : "Preview failed";
+        setMessage(msg);
+        setPreviewState((prev) => {
+          const next = { ...prev };
+          const themeEntry = { ...(next[themeId] || {}) };
+          filters.forEach((f) => {
+            themeEntry[f.id] = { status: "error" };
+          });
+          next[themeId] = themeEntry;
+          return next;
+        });
+      } finally {
+        setLoadingPreviews(false);
       }
-      const result = await fetchPreview({ ...payload, aoi_bounds: aoiBounds });
-      setPreview({ image: result.png_base64, bbox: result.bbox, scene: result.scene_metadata });
-      if (result.png_base64) {
-        setPreviewImageUrl(`data:image/png;base64,${result.png_base64}`);
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Preview failed");
-    } finally {
-      setLoading(false);
+    },
+    [aoiBounds, applyBatchResults, markFiltersLoading, payloadCenter.lat, payloadCenter.lon, payloadSizeKm, resetCurrentPreview],
+  );
+
+  useEffect(() => {
+    if (!aoiBounds) return;
+    if (previewRequestRef.current) {
+      clearTimeout(previewRequestRef.current);
+    }
+    previewRequestRef.current = setTimeout(() => {
+      triggerBatchPreview(selectedThemeId);
+      previewRequestRef.current = null;
+    }, 150);
+  }, [aoiBounds, selectedThemeId, triggerBatchPreview]);
+
+  useEffect(() => {
+    updatePreviewFromState(selectedThemeId, selectedFilterId);
+  }, [selectedFilterId, selectedThemeId, updatePreviewFromState]);
+
+  const handleFilterSelect = (id: string) => {
+    setSelectedFilterId(id);
+    const entry = previewState[selectedThemeId]?.[id];
+    if (entry?.status === "ready" && entry.imageUrl) {
+      setPreviewImageUrl(entry.imageUrl);
+      setPreviewBounds(entry.bbox ?? null);
+      setSceneInfo(entry.scene);
     }
   };
 
-  const handlePreviewClick = () => {
-    console.log("[page.tsx] Preview button clicked. Current AOI bounds:", aoiBounds);
+  const triggerDraw = () => {
+    setPreviewImageUrl(null);
+    setAoiBounds(null);
+    setCustomAoiMode(true);
+    setDrawCommand((c) => c + 1);
+  };
+
+  const runExport = async () => {
     if (!aoiBounds) {
       setMessage("Draw an AOI first.");
       return;
     }
-    if (previewClickRef.current) {
-      clearTimeout(previewClickRef.current);
+    if (!currentFilter) {
+      setMessage("Select a filter first.");
+      return;
     }
-    previewClickRef.current = setTimeout(() => {
-      previewClickRef.current = null;
-      runPreview();
-    }, 250);
-  };
-
-  const runExport = async () => {
     setExporting(true);
     setMessage("Rendering export…");
+    const payload: ExportFilterRequest = {
+      lat: payloadCenter.lat,
+      lon: payloadCenter.lon,
+      size_km: payloadSizeKm,
+      aoi_bounds: aoiBounds,
+      target_size_px: 4096,
+      filter: {
+        id: currentFilter.id,
+        styleType: currentFilter.styleType,
+        params: currentFilter.params,
+      },
+    };
     try {
-      const preferredBounds = effectiveBounds ?? bbox ?? defaultBoundsAround(payloadCenter, selectedSizeKm);
-      const exportCenterLat = (preferredBounds[1] + preferredBounds[3]) / 2;
-      const exportCenterLon = (preferredBounds[0] + preferredBounds[2]) / 2;
-      const latKm = Math.abs(preferredBounds[3] - preferredBounds[1]) * 111;
-      const lonKm = Math.abs(preferredBounds[2] - preferredBounds[0]) * 111 * Math.cos((exportCenterLat * Math.PI) / 180);
-      const exportSizeKm = Math.max(latKm, lonKm, 1);
-      const exportPayload = {
-        lat: exportCenterLat,
-        lon: exportCenterLon,
-        size_km: exportSizeKm,
-        theme,
-        overlays,
-        target_size_px: 4096,
-        palette: paletteEnabled ? palette : undefined,
-        pcaScheme: paletteEnabled ? palette : undefined,
-        indexPack: theme === "index_triplet" ? indexPack : undefined,
-        overlayStyles,
-        background: backgroundConfig,
-      };
-      const blob = await exportImage(exportPayload);
+      const blob = await exportFilterImage(payload);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `earth-art-${theme}.png`;
+      link.download = `earth-art-${currentFilter.id}.png`;
       link.click();
       URL.revokeObjectURL(url);
       setMessage("Export ready.");
@@ -215,241 +274,134 @@ export default function Page() {
     }
   };
 
+  const anyLoading = loadingPreviews || !!currentFilters.find((f) => previewState[selectedThemeId]?.[f.id]?.status === "loading");
+  const previewForFilter = previewState[selectedThemeId]?.[selectedFilterId];
+
+  const presets = useMemo(() => getPresets(), []);
+
+  const applyPresetAoi = useCallback(() => {
+    if (!currentPreset) return;
+    const center =
+      mapBounds && mapBounds.length === 4 ? boundsCenter(mapBounds) : payloadCenter ?? { lat: 32.7157, lon: -117.1611 };
+    const feature = createAoiPolygonFromPreset(currentPreset, selectedThemeId, center.lon, center.lat);
+    const bbox = bboxFromFeature(feature);
+    setAoiBounds(bbox);
+    setCustomAoiMode(false);
+  }, [currentPreset, mapBounds, payloadCenter, selectedThemeId]);
+
+  useEffect(() => {
+    if (customAoiMode) return;
+    if (currentPreset && payloadCenter) {
+      applyPresetAoi();
+    }
+  }, [applyPresetAoi, currentPreset, customAoiMode, payloadCenter]);
+
   return (
     <main className="page">
       <section className="controls">
         <h1>Earth Art</h1>
-        <p className="subtitle">Select a place, pick a spectral theme, and create artful remote sensing exports.</p>
+        <p className="subtitle">Search, draw an AOI, and flip through artful filters instantly.</p>
         <SearchBar
           onSelect={(lat, lon, label) => {
             setFlyToTarget({ lat, lon, token: Date.now() });
-            setPreview({});
+            setMessage(`Focused on ${label}`);
             setPreviewImageUrl(null);
             setAoiBounds(null);
-            setMessage(`Focused on ${label}`);
           }}
         />
-        <div className="size-picker">
-          <p>Area size (km)</p>
-          <div className="preset-group">
-            {sizePresets.map((option) => (
+        <div className="preset-picker">
+          <p className="card-title">Choose your canvas</p>
+          <div className="preset-grid">
+            {presets.map((preset) => (
               <button
-                key={option}
-                className={Math.round(option) === Math.round(selectedSizeKm) ? "active" : ""}
+                key={preset.id}
+                className={`filter-card ${selectedPresetId === preset.id ? "active" : ""}`}
                 onClick={() => {
-                  setSelectedSizeKm(option);
-                  triggerSizeCommand(option);
+                  setSelectedPresetId(preset.id);
+                  setCustomAoiMode(false);
+                  applyPresetAoi();
                 }}
               >
-                {option} km
+                <div className="filter-header">
+                  <span className="filter-name">{preset.name}</span>
+                </div>
+                <p className="filter-description">{preset.description ?? ""}</p>
               </button>
             ))}
           </div>
-          <label className="size-freeform">
-            Custom
-            <input
-              type="range"
-              min={1}
-              max={500}
-              step={1}
-              value={selectedSizeKm}
-              onChange={(e) => setSelectedSizeKm(Number(e.target.value))}
-              onMouseUp={(e) => {
-                const nextValue = Number(e.currentTarget.value);
-                setSelectedSizeKm(nextValue);
-                triggerSizeCommand(nextValue);
+          <p className="hint">We keep a wider view so the artwork looks smooth and detailed in print.</p>
+        </div>
+        <div className="theme-switcher">
+          {THEMES.map((theme) => (
+            <button
+              key={theme.id}
+              className={theme.id === selectedThemeId ? "active" : ""}
+              onClick={() => {
+                setThemeAndFilter(theme.id);
+                if (aoiBounds) {
+                  triggerBatchPreview(theme.id);
+                }
               }}
-              onTouchEnd={(e) => {
-                const target = e.currentTarget as HTMLInputElement;
-                const nextValue = Number(target.value);
-                setSelectedSizeKm(nextValue);
-                triggerSizeCommand(nextValue);
-              }}
-            />
-            <input
-              type="number"
-              min={1}
-              max={50}
-              step={1}
-              value={selectedSizeKm}
-              onChange={(e) => setSelectedSizeKm(Number(e.target.value))}
-              onBlur={(e) => {
-                const nextValue = Number(e.target.value);
-                setSelectedSizeKm(nextValue);
-                triggerSizeCommand(nextValue);
-              }}
-            />
-            km
-          </label>
+            >
+              {theme.name}
+            </button>
+          ))}
         </div>
-        <button
-          onClick={() => {
-            setPreviewImageUrl(null);
-            setAoiBounds(null);
-            setDrawCommand((c) => c + 1);
-          }}
-        >
-          Draw AOI
-        </button>
-        <ThemePicker
-          theme={theme}
-          onChange={(next) => {
-            setTheme(next);
-            if (next !== "index_triplet") {
-              setIndexPack("veg");
-            }
-          }}
-        />
-        {paletteAwareThemes.includes(theme) && <PalettePicker palette={palette} onChange={setPalette} />}
-        {theme === "index_triplet" && <IndexPackPicker value={indexPack} onChange={setIndexPack} />}
-        <div className="style-card">
-          <p className="card-title">Road styling</p>
-          <div className="style-row">
-            <label>
-              Color
-              <input type="color" value={roadColor} onChange={(e) => setRoadColor(e.target.value)} />
-            </label>
-            <label>
-              Width {roadWidth.toFixed(0)} px
-              <input
-                type="range"
-                min={1}
-                max={8}
-                step={1}
-                value={roadWidth}
-                onChange={(e) => setRoadWidth(Number(e.target.value))}
-              />
-            </label>
-            <label>
-              Opacity {(roadOpacity * 100).toFixed(0)}%
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={roadOpacity}
-                onChange={(e) => setRoadOpacity(Number(e.target.value))}
-              />
-            </label>
-          </div>
+        <div className="filter-grid">
+          {currentFilters.map((filter) => {
+            const status = previewState[selectedThemeId]?.[filter.id]?.status ?? "idle";
+            return (
+              <button
+                key={filter.id}
+                className={`filter-card ${selectedFilterId === filter.id ? "active" : ""}`}
+                onClick={() => handleFilterSelect(filter.id)}
+              >
+                <div className="filter-header">
+                  <span className="filter-name">{filter.name}</span>
+                  <span className={`status-dot ${status}`}></span>
+                </div>
+                <p className="filter-description">{filter.description}</p>
+              </button>
+            );
+          })}
         </div>
-        <div className="style-card">
-          <p className="card-title">Building styling</p>
-          <div className="style-row">
-            <label>
-              Color
-              <input type="color" value={buildingColor} onChange={(e) => setBuildingColor(e.target.value)} />
-            </label>
-            <label>
-              Outline {buildingOutline.toFixed(1)} px
-              <input
-                type="range"
-                min={0}
-                max={3}
-                step={0.5}
-                value={buildingOutline}
-                onChange={(e) => setBuildingOutline(Number(e.target.value))}
-              />
-            </label>
-            <label>
-              Outline opacity {(buildingOpacity * 100).toFixed(0)}%
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={buildingOpacity}
-                onChange={(e) => setBuildingOpacity(Number(e.target.value))}
-              />
-            </label>
-            <label>
-              Fill opacity {(buildingFillOpacity * 100).toFixed(0)}%
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={buildingFillOpacity}
-                onChange={(e) => setBuildingFillOpacity(Number(e.target.value))}
-              />
-            </label>
-          </div>
-        </div>
-        <div className="style-card">
-          <p className="card-title">Background</p>
-          <div className="background-modes">
-            <label>
-              <input type="radio" name="bg-mode" checked={bgMode === "imagery"} onChange={() => setBgMode("imagery")} />
-              Imagery
-            </label>
-            <label>
-              <input type="radio" name="bg-mode" checked={bgMode === "solid"} onChange={() => setBgMode("solid")} />
-              Solid
-            </label>
-            {bgMode === "solid" && (
-              <label className="background-color">
-                Color
-                <input type="color" value={bgColor} onChange={(e) => setBgColor(e.target.value)} />
-              </label>
-            )}
-          </div>
-        </div>
-        <div className="style-card">
-          <p className="card-title">Map basemap</p>
-          <div className="background-modes">
-            <label>
-              <input
-                type="radio"
-                name="map-style"
-                checked={basemapMode === "imagery"}
-                onChange={() => setBasemapMode("imagery")}
-              />
-              Imagery
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="map-style"
-                checked={basemapMode === "vector"}
-                onChange={() => setBasemapMode("vector")}
-              />
-              Basic
-            </label>
-          </div>
-        </div>
-        <OverlayToggles overlays={overlays} onChange={setOverlays} />
-        <label className="selection-toggle">
-          <input type="checkbox" checked={showSelection} onChange={(e) => setShowSelection(e.target.checked)} />
-          Show selection box
-        </label>
         <div className="actions">
-          <button onClick={handlePreviewClick} disabled={loading}>
-            {loading ? "Rendering…" : "Preview"}
+          <button onClick={() => aoiBounds && triggerBatchPreview(selectedThemeId)} disabled={!aoiBounds || anyLoading}>
+            {anyLoading ? "Rendering…" : "Refresh Previews"}
           </button>
-          <button onClick={runExport} disabled={exporting || loading}>
+          <button onClick={runExport} disabled={exporting || anyLoading || !previewForFilter || previewForFilter.status !== "ready"}>
             {exporting ? "Exporting…" : "Export 4K"}
           </button>
         </div>
+        <details className="advanced">
+          <summary>Advanced</summary>
+          <p className="hint">Custom AOI draw (experimental). Too-small AOIs may look coarse.</p>
+          <div className="actions-row">
+            <button onClick={triggerDraw}>Custom AOI (draw)</button>
+            <button onClick={() => setClearCommand((c) => c + 1)}>Clear</button>
+          </div>
+        </details>
         {message && <p className="hint">{message}</p>}
         <pre className="debug-aoi">AOI bounds: {aoiBounds ? JSON.stringify(aoiBounds) : "null"}</pre>
       </section>
       <section className="preview-section">
         <PreviewPane
-          selectedSizeKm={selectedSizeKm}
-          sizeCommand={sizeCommand}
+          selectedSizeKm={payloadSizeKm}
+          sizeCommand={null}
           drawCommand={drawCommand}
           clearCommand={clearCommand}
           flyToTarget={flyToTarget}
           previewImageUrl={previewImageUrl}
-          previewBounds={previewImageUrl ? preview.bbox ?? null : null}
-          loading={loading}
-          sceneInfo={preview.scene}
-          showSelection={showSelection}
-          basemap={basemapMode}
+          previewBounds={previewBounds}
+          presetBounds={aoiBounds}
+          loading={anyLoading}
+          sceneInfo={sceneInfo}
+          showSelection={true}
+          basemap="imagery"
           onBoundsChange={setMapBounds}
           onAoiBoundsChange={setAoiBounds}
-          onClearPreview={handleClearPreview}
-          onSizeCommandHandled={() => setSizeCommand(null)}
+          onClearPreview={resetCurrentPreview}
+          onSizeCommandHandled={() => null}
         />
       </section>
       <style jsx>{`
@@ -472,9 +424,6 @@ export default function Page() {
         }
         .preview-section {
           width: 100%;
-        }
-        h1 {
-          margin: 0;
         }
         .subtitle {
           color: #94a3b8;
@@ -514,97 +463,114 @@ export default function Page() {
         .size-freeform input[type='range'] {
           flex: 1;
         }
-        .selection-toggle {
+        .actions-row {
           display: flex;
-          align-items: center;
           gap: 0.5rem;
-          color: #cbd5f5;
-          font-size: 0.9rem;
         }
-        .style-card {
-          padding: 0.75rem 0.85rem;
+        .theme-switcher {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 0.5rem;
+        }
+        .theme-switcher button {
+          padding: 0.6rem;
+          border-radius: 10px;
+          border: 1px solid #1f2937;
+          background: rgba(255, 255, 255, 0.03);
+          color: #e5e7eb;
+        }
+        .theme-switcher button.active {
+          background: linear-gradient(135deg, #2563eb, #7c3aed);
+          border-color: #2563eb;
+          color: #fff;
+        }
+        .filter-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 0.6rem;
+        }
+        .filter-card {
+          text-align: left;
+          background: rgba(255, 255, 255, 0.03);
+          border: 1px solid #1f2937;
           border-radius: 12px;
-          background: rgba(15, 23, 42, 0.6);
-          border: 1px solid rgba(255, 255, 255, 0.05);
+          padding: 0.65rem;
+          color: #e2e8f0;
+          min-height: 96px;
         }
-        .card-title {
-          margin: 0 0 0.35rem;
+        .filter-card:hover {
+          border-color: #2563eb;
+          cursor: pointer;
+        }
+        .filter-card.active {
+          border-color: #2563eb;
+          box-shadow: 0 6px 18px rgba(37, 99, 235, 0.25);
+        }
+        .filter-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 0.25rem;
+        }
+        .filter-name {
           font-weight: 600;
-          color: #cbd5f5;
+          color: #fff;
         }
-        .style-row {
-          display: flex;
-          flex-direction: column;
-          gap: 0.4rem;
-        }
-        .style-row label {
-          display: flex;
-          flex-direction: column;
-          gap: 0.1rem;
+        .filter-description {
+          margin: 0;
+          color: #94a3b8;
           font-size: 0.85rem;
         }
-        .style-row input[type='color'] {
-          width: 100%;
-          height: 32px;
-          border: none;
-          background: transparent;
+        .status-dot {
+          display: inline-block;
+          width: 10px;
+          height: 10px;
+          border-radius: 999px;
+          background: #475569;
         }
-        .style-row input[type='range'] {
-          width: 100%;
+        .status-dot.ready {
+          background: #22c55e;
         }
-        .background-modes {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 0.6rem;
-          align-items: center;
+        .status-dot.loading {
+          background: #f59e0b;
+          animation: pulse 1.2s infinite;
         }
-        .background-modes label {
-          display: flex;
-          align-items: center;
-          gap: 0.35rem;
-          font-size: 0.9rem;
+        .status-dot.error {
+          background: #ef4444;
         }
-        .background-color {
-          flex: 1;
+        @keyframes pulse {
+          0% { opacity: 0.6; }
+          50% { opacity: 1; }
+          100% { opacity: 0.6; }
         }
         .actions {
           display: flex;
-          gap: 0.75rem;
+          gap: 0.5rem;
         }
         .actions button {
           flex: 1;
-          padding: 0.75rem;
-          border-radius: 999px;
-          border: none;
-          background: #10b981;
-          color: #04211a;
-          font-weight: 600;
-        }
-        .actions button:last-child {
-          background: #f97316;
-          color: #1b0d04;
         }
         .hint {
-          color: #fda4af;
+          color: #f87171;
+          margin: 0;
+          font-size: 0.9rem;
         }
         .debug-aoi {
-          font-size: 0.7rem;
-          color: #94a3b8;
+          font-size: 0.75rem;
+          color: #64748b;
+          margin: 0.25rem 0 0;
           word-break: break-all;
         }
-        @media (max-width: 1024px) {
-          .page {
-            grid-template-columns: 1fr;
-            gap: 1.5rem;
-          }
-          .preview-section {
-            min-height: 70vh;
-          }
+        button {
+          border: none;
+          background: #2563eb;
+          color: #fff;
+          padding: 0.65rem 0.9rem;
+          border-radius: 10px;
         }
-        @media (max-width: 640px) {
-          .page {
-            padding: 1.5rem;
-          }
+        button:disabled {
+          opacity: 0.6;
+          cursor: not-allowed;
         }
       `}</style>
     </main>
