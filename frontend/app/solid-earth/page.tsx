@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { SOLID_EARTH_LOCATIONS } from "./locations";
+import SearchBar from "../components/SearchBar";
 
 export default function SolidEarthLanding() {
   const router = useRouter();
@@ -17,6 +18,13 @@ export default function SolidEarthLanding() {
       <div className="header">
         <h1>Solid Earth</h1>
         <p className="lede">Choose a landscape to begin, or search for your own.</p>
+      </div>
+      <div className="search">
+        <SearchBar
+          onSelect={(lat, lon) => {
+            router.push(`/solid-earth/playground?lat=${lat}&lon=${lon}&preset=square`);
+          }}
+        />
       </div>
       <div className="locations">
         {SOLID_EARTH_LOCATIONS.map((loc) => (
@@ -40,28 +48,34 @@ export default function SolidEarthLanding() {
           I’m feeling lucky
         </button>
         <Link className="ghost" href="/solid-earth/playground">
-          Search your own
+          Open playground
         </Link>
       </div>
       <style jsx>{`
         .solid-landing {
-          padding: 32px;
-          max-width: 1200px;
+          padding: 40px 32px 48px;
+          max-width: 1400px;
           margin: 0 auto;
+          color: #e8ecf7;
+        }
+        .search {
+          max-width: 420px;
+          margin: 10px 0 4px;
         }
         .lede {
-          color: #94a3b8;
+          color: #aebad5;
+          font-size: 1.1rem;
         }
         .locations {
           display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-          gap: 16px;
-          margin-top: 18px;
+          grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+          gap: 22px;
+          margin-top: 22px;
         }
         .loc-card {
-          background: rgba(255, 255, 255, 0.04);
+          background: rgba(255, 255, 255, 0.03);
           border: 1px solid rgba(255, 255, 255, 0.08);
-          border-radius: 12px;
+          border-radius: 14px;
           overflow: hidden;
           text-decoration: none;
           color: inherit;
@@ -74,7 +88,7 @@ export default function SolidEarthLanding() {
           box-shadow: 0 12px 26px rgba(0, 0, 0, 0.35);
         }
         .thumb {
-          height: 150px;
+          height: 240px;
           overflow: hidden;
         }
         .thumb img {
@@ -83,12 +97,23 @@ export default function SolidEarthLanding() {
           object-fit: cover;
         }
         .copy {
-          padding: 12px;
+          padding: 14px;
+        }
+        h3 {
+          margin: 0 0 6px;
+          font-size: 1.3rem;
+          color: #edf2ff;
+        }
+        p {
+          margin: 0;
+          color: #c2cbe2;
+          line-height: 1.55;
+          font-size: 1rem;
         }
         .actions {
           display: flex;
           gap: 12px;
-          margin-top: 20px;
+          margin-top: 24px;
         }
         .primary,
         .ghost {
@@ -97,6 +122,7 @@ export default function SolidEarthLanding() {
           border: none;
           cursor: pointer;
           font-weight: 600;
+          min-width: 160px;
         }
         .primary {
           background: linear-gradient(135deg, #2563eb, #7c3aed);

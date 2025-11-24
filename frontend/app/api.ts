@@ -37,6 +37,7 @@ export interface ExportFilterRequest extends AoiPayload {
   filter: FilterRequestItem;
   target_size_px: number;
   watermark?: string;
+  adjustments?: { brightness?: number; contrast?: number; saturation?: number };
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";

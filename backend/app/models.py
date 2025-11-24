@@ -154,3 +154,4 @@ class ExportFilterRequest(BaseModel):
     filter: FilterSpec
     target_size_px: PositiveInt = Field(4096, le=8192)
     watermark: Optional[str] = Field(default=None, max_length=64)
+    adjustments: Optional[Dict[str, float]] = None

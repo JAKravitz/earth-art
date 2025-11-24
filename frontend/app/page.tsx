@@ -4,36 +4,37 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 
 const heroImages = [
-  "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=80",
+  "https://images.unsplash.com/photo-1469474968028-56623f02e42e?auto=format&fit=crop&w=1600&q=80",
   "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1600&q=80",
-  "https://images.unsplash.com/photo-1497906539264-eb74442e37ab?auto=format&fit=crop&w=1600&q=80",
 ];
 
 export default function LandingPage() {
   const [heroIndex, setHeroIndex] = useState(0);
+  const [fixedImage, setFixedImage] = useState(heroImages[0]);
   useEffect(() => {
     const id = setInterval(() => {
       setHeroIndex((i) => (i + 1) % heroImages.length);
-    }, 4000);
+      setFixedImage((prev) => heroImages[(heroImages.indexOf(prev) + 1) % heroImages.length]);
+    }, 7000);
     return () => clearInterval(id);
   }, []);
 
   return (
     <div className="landing">
       <div className="hero-image">
-        <img src={heroImages[heroIndex]} alt="Earth art hero" />
+        <img src={fixedImage} alt="Earth art hero" />
       </div>
       <div className="hero-copy">
-        <h1>Earthsy</h1>
+        <h1 className="title">Earthsy</h1>
         <p className="lede">
           Earthsy turns real satellite and geospatial data into custom artwork. Explore landscapes, rivers, and cities and
           transform them into unique prints.
         </p>
         <div className="cta-group">
-          <Link className="primary" href="/products">
+          <Link className="primary btn" href="/products">
             Get started
           </Link>
-          <Link className="ghost" href="/solid-earth">
+          <Link className="ghost btn" href="/solid-earth">
             See a live example
           </Link>
         </div>
@@ -43,19 +44,21 @@ export default function LandingPage() {
         .landing {
           display: grid;
           grid-template-columns: 1.2fr 1fr;
-          min-height: calc(100vh - 72px);
-          padding: 32px;
+          height: calc(100vh - 72px);
+          padding: 32px 28px;
           gap: 24px;
           background: radial-gradient(circle at 20% 20%, rgba(37, 99, 235, 0.1), transparent 35%),
             radial-gradient(circle at 80% 0%, rgba(124, 58, 237, 0.12), transparent 30%),
             #0b0f19;
+          overflow: hidden;
         }
         .hero-image {
           position: relative;
           border-radius: 18px;
           overflow: hidden;
           box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
-          min-height: 420px;
+          height: 70vh;
+          min-height: 480px;
         }
         .hero-image img {
           width: 100%;
@@ -70,9 +73,9 @@ export default function LandingPage() {
           align-self: center;
           padding: 12px;
         }
-        h1 {
+        .title {
           margin: 0;
-          font-size: 3rem;
+          font-size: clamp(2.8rem, 4vw, 4rem);
         }
         .lede {
           color: #cbd5f5;
@@ -80,27 +83,40 @@ export default function LandingPage() {
         }
         .cta-group {
           display: flex;
-          gap: 12px;
+          gap: 16px;
           align-items: center;
           margin-top: 8px;
         }
-        .primary,
-        .ghost {
-          padding: 12px 18px;
+        :global(a.btn) {
+          padding: 14px 22px;
           border-radius: 10px;
-          text-decoration: none;
           font-weight: 600;
+          font-size: 1.05rem;
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 160px;
+          transition: transform 0.15s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+          text-decoration: none;
         }
-        .primary {
+        :global(a.primary) {
           background: linear-gradient(135deg, #2563eb, #7c3aed);
           color: #fff;
+          box-shadow: 0 10px 24px rgba(37, 99, 235, 0.3);
         }
-        .ghost {
+        :global(a.primary:hover) {
+          transform: translateY(-2px);
+          box-shadow: 0 14px 28px rgba(37, 99, 235, 0.4);
+        }
+        :global(a.ghost) {
           color: #cbd5f5;
           border: 1px solid rgba(255, 255, 255, 0.08);
+          background: rgba(255, 255, 255, 0.02);
         }
-        .ghost:hover {
-          border-color: rgba(255, 255, 255, 0.2);
+        :global(a.ghost:hover) {
+          border-color: rgba(255, 255, 255, 0.3);
+          transform: translateY(-2px);
         }
         .hint {
           color: #94a3b8;
@@ -110,13 +126,15 @@ export default function LandingPage() {
           .landing {
             grid-template-columns: 1fr;
             padding: 20px;
+            height: auto;
           }
           .hero-copy {
             order: 2;
           }
           .hero-image {
             order: 1;
-            min-height: 260px;
+            height: 320px;
+            min-height: 320px;
           }
         }
       `}</style>

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 import xarray as xr
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageEnhance
 
 
 def make_solid_canvas(height: int, width: int, hex_color: str | None) -> np.ndarray:
@@ -146,3 +146,19 @@ def encode_png(image: Image.Image) -> Tuple[bytes, str]:
     raw = buffer.getvalue()
     encoded = base64.b64encode(raw).decode("utf-8")
     return raw, encoded
+
+
+def apply_enhancements(image: Image.Image, adjustments: dict | None) -> Image.Image:
+    if not adjustments:
+        return image
+    brightness = float(adjustments.get("brightness", 1.0))
+    contrast = float(adjustments.get("contrast", 1.0))
+    saturation = float(adjustments.get("saturation", 1.0))
+    img = image
+    if brightness != 1.0:
+        img = ImageEnhance.Brightness(img).enhance(brightness)
+    if contrast != 1.0:
+        img = ImageEnhance.Contrast(img).enhance(contrast)
+    if saturation != 1.0:
+        img = ImageEnhance.Color(img).enhance(saturation)
+    return img

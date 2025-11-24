@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
+import { EarthsySessionProvider } from "./context/EarthsySession";
 
 export const metadata: Metadata = {
   title: "Earthsy",
@@ -16,6 +17,7 @@ function TopNav() {
         </Link>
       </div>
       <nav className="nav-links">
+        <Link href="/">Home</Link>
         <Link href="/products">Products</Link>
         <Link href="/contact">Contact</Link>
       </nav>
@@ -27,8 +29,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
-        <TopNav />
-        <main className="app-shell">{children}</main>
+        <EarthsySessionProvider>
+          <TopNav />
+          <main className="app-shell">{children}</main>
+        </EarthsySessionProvider>
       </body>
     </html>
   );

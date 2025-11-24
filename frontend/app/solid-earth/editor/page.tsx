@@ -3,35 +3,74 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FILTERS, getFilterById, getFiltersForTheme } from "../../config/themesAndFilters";
+import { getFilterById, getFiltersForTheme } from "../../config/themesAndFilters";
+import { useEarthsySession } from "../../context/EarthsySession";
+import { exportFilterImage } from "../../api";
 
-type PreviewMap = Record<string, { imageUrl: string; filterId: string }>;
+function bboxWidthKm(bbox: [number, number, number, number]): number {
+  const [w, s, e, n] = bbox;
+  const centerLat = (s + n) / 2;
+  return Math.abs(e - w) * 111 * Math.cos((centerLat * Math.PI) / 180);
+}
 
 export default function SolidEarthEditor() {
   const router = useRouter();
-  // TODO: replace with context-driven previews once session store is added
-  const [previews, setPreviews] = useState<PreviewMap>({});
+  const { previewsByFilterId, selectedFilterId, setSelectedFilterId, adjustments, setAdjustments, aoiBounds, center } =
+    useEarthsySession();
   const filters = useMemo(() => getFiltersForTheme("earth-science"), []);
-  const [selectedFilterId, setSelectedFilterId] = useState(filters[0]?.id ?? "");
-  const [adjustments, setAdjustments] = useState({ brightness: 100, contrast: 100, saturation: 100 });
-
-  const currentPreview = previews[selectedFilterId];
+  const currentId = selectedFilterId || Object.keys(previewsByFilterId)[0] || filters[0]?.id;
+  const currentPreview = currentId ? previewsByFilterId[currentId] : undefined;
 
   useEffect(() => {
-    // guard: if no previews loaded, send back
-    if (!Object.keys(previews).length) {
-      // For now, stay; in final flow, redirect to playground
+    if (!Object.keys(previewsByFilterId).length) {
+      router.push("/solid-earth/playground");
     }
-  }, [previews]);
+  }, [previewsByFilterId, router]);
+
+  useEffect(() => {
+    if (!selectedFilterId && Object.keys(previewsByFilterId).length) {
+      setSelectedFilterId(Object.keys(previewsByFilterId)[0]);
+    }
+  }, [previewsByFilterId, selectedFilterId, setSelectedFilterId]);
 
   const applyCssFilter = () => {
     const { brightness, contrast, saturation } = adjustments;
     return `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturation}%)`;
   };
 
-  const handleExport = () => {
-    // TODO: wire to backend export with AOI + filter + adjustments
-    alert("Export flow to be wired to backend high-res render.");
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = async () => {
+    if (!currentId || !aoiBounds) return;
+    const filter = getFilterById(currentId);
+    if (!filter) return;
+    setExporting(true);
+    try {
+      const sizeKm = Math.max(1, bboxWidthKm(aoiBounds));
+      const blob = await exportFilterImage({
+        lat: center.lat,
+        lon: center.lon,
+        size_km: sizeKm,
+        aoi_bounds: aoiBounds,
+        filter: { id: filter.id, styleType: filter.styleType, params: filter.params },
+        target_size_px: 4096,
+        adjustments: {
+          brightness: adjustments.brightness / 100,
+          contrast: adjustments.contrast / 100,
+          saturation: adjustments.saturation / 100,
+        },
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `earthsy-${filter.id}.png`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -40,8 +79,14 @@ export default function SolidEarthEditor() {
         <h3>Filters</h3>
         <div className="thumbs">
           {filters.map((f) => (
-            <button key={f.id} className={`thumb ${selectedFilterId === f.id ? "active" : ""}`} onClick={() => setSelectedFilterId(f.id)}>
-              <div className="mini">{previews[f.id]?.imageUrl ? <img src={previews[f.id].imageUrl} alt={f.name} /> : <div className="placeholder" />}</div>
+            <button key={f.id} className={`thumb ${currentId === f.id ? "active" : ""}`} onClick={() => setSelectedFilterId(f.id)}>
+              <div className="mini">
+                {previewsByFilterId[f.id]?.imageUrl ? (
+                  <img src={previewsByFilterId[f.id].imageUrl} alt={f.name} />
+                ) : (
+                  <div className="placeholder" />
+                )}
+              </div>
               <span>{f.name}</span>
             </button>
           ))}
@@ -67,13 +112,13 @@ export default function SolidEarthEditor() {
               min={50}
               max={200}
               value={adjustments[key as keyof typeof adjustments]}
-              onChange={(e) => setAdjustments((prev) => ({ ...prev, [key]: Number(e.target.value) }))}
+              onChange={(e) => setAdjustments({ [key]: Number(e.target.value) } as any)}
             />
           </label>
         ))}
         <div className="buttons">
-          <button className="primary" onClick={handleExport}>
-            Export high-resolution
+          <button className="primary" onClick={handleExport} disabled={exporting}>
+            {exporting ? "Exporting…" : "Export high-resolution"}
           </button>
           <Link className="ghost" href="/solid-earth/playground">
             Back to playground

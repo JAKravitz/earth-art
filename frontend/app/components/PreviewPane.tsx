@@ -95,6 +95,7 @@ export default function PreviewPane({
   const viewStateRef = useRef<ViewState>(DEFAULT_VIEW);
   const aoiRectRef = useRef<AoiRect | null>(null);
   const latestBoundsRef = useRef<AoiBounds | null>(null);
+  const [mapReady, setMapReady] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [aoiRect, setAoiRect] = useState<AoiRect | null>(null);
@@ -231,18 +232,21 @@ export default function PreviewPane({
 
   useEffect(() => {
     latestBoundsRef.current = activeBounds ?? null;
-    syncAoiOverlayToBounds();
-  }, [activeBounds, syncAoiOverlayToBounds]);
+    if (mapReady) {
+      syncAoiOverlayToBounds();
+    }
+  }, [activeBounds, mapReady, syncAoiOverlayToBounds]);
 
   useEffect(() => {
-    if (!presetBoundsObj) return;
+    if (!presetBoundsObj || !mapReady) return;
     latestBoundsRef.current = presetBoundsObj;
     setLatestBounds(presetBoundsObj);
     const rect = projectBoundsToRect(presetBoundsObj);
     if (rect) {
       setAoiRect(rect);
     }
-  }, [presetBoundsObj, projectBoundsToRect]);
+  }, [mapReady, presetBoundsObj, projectBoundsToRect]);
+
 
   const ensureZoomEnabled = useCallback(() => {
     const map = mapRef.current;
@@ -278,6 +282,12 @@ export default function PreviewPane({
     mapRef.current = map;
 
     map.on("load", () => {
+      setMapReady(true);
+      map.dragPan.enable();
+      map.scrollZoom.enable();
+      map.doubleClickZoom.enable();
+      map.touchZoomRotate.enable();
+      map.boxZoom.enable();
       if (onBoundsChange) {
         const b = map.getBounds();
         onBoundsChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
@@ -374,19 +384,12 @@ export default function PreviewPane({
   const toggleMapInteractions = useCallback((enable: boolean) => {
     const map = mapRef.current;
     if (!map) return;
-    if (enable) {
-      map.dragPan.enable();
-      map.scrollZoom.enable();
-      map.doubleClickZoom.enable();
-      map.touchZoomRotate.enable();
-      map.boxZoom.enable();
-    } else {
-      map.dragPan.disable();
-      map.scrollZoom.disable();
-      map.doubleClickZoom.disable();
-      map.touchZoomRotate.disable();
-      map.boxZoom.disable();
-    }
+    // Always enable interactions; we no longer disable them to avoid blocking pan/zoom
+    map.dragPan.enable();
+    map.scrollZoom.enable();
+    map.doubleClickZoom.enable();
+    map.touchZoomRotate.enable();
+    map.boxZoom.enable();
   }, []);
 
   useEffect(() => {
@@ -588,6 +591,7 @@ export default function PreviewPane({
           inset: 0;
           border-radius: 20px;
           overflow: hidden;
+          pointer-events: auto;
         }
         .meta-badge {
           position: absolute;

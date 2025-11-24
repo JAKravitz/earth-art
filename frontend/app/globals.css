@@ -18,9 +18,11 @@ button {
 }
 
 .top-nav {
-  position: sticky;
+  position: fixed;
   top: 0;
-  z-index: 50;
+  left: 0;
+  right: 0;
+  z-index: 1000;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -35,6 +37,7 @@ button {
   font-size: 1.2rem;
   color: #e5e7eb;
   text-decoration: none;
+  cursor: pointer;
 }
 
 .nav-links {
@@ -54,5 +57,5 @@ button {
 }
 
 .app-shell {
-  padding: 0;
+  padding: 72px 0 0 0;
 }
