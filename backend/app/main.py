@@ -234,6 +234,15 @@ def export_filter(request: ExportFilterRequest) -> Response:
 
     rgb = render_filter(stack, selection, request.filter, preview_mode=False)
     image = render.to_image(rgb, gamma=1.0, apply_stretch=False)
+    if request.adjustments:
+        image = render.apply_enhancements(
+            image,
+            {
+                "brightness": float(request.adjustments.get("brightness", 1.0)),
+                "contrast": float(request.adjustments.get("contrast", 1.0)),
+                "saturation": float(request.adjustments.get("saturation", 1.0)),
+            },
+        )
     image = render.scale_to_max(image, request.target_size_px)
     if request.watermark:
         image = render.add_watermark(image, request.watermark)
