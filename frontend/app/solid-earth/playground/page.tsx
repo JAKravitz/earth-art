@@ -5,31 +5,58 @@ import { useRouter, useSearchParams } from "next/navigation";
 import PreviewPane from "../../components/PreviewPane";
 import { getPresets, ProductPresetId } from "../../config/aoiPresets";
 import { THEMES, getFiltersForTheme, ThemeId } from "../../config/themesAndFilters";
-import { createAoiPolygonFromPreset, bboxFromFeature } from "../../utils/aoiFromPreset";
 import { fetchBatchPreviews, BatchPreviewRequest } from "../../api";
 import SearchBar from "../../components/SearchBar";
 
 const DEFAULT_CENTER = { lat: 32.7157, lon: -117.1611 };
 const DEFAULT_THEME: ThemeId = "earth-science";
 
+type PresetSizeSpec = { widthKm: number; heightKm: number };
+
+const PRESET_SPECS: Record<ProductPresetId, PresetSizeSpec> = {
+  square: { widthKm: 20, heightKm: 20 },
+  "poster-landscape": { widthKm: 30, heightKm: 20 },
+  "poster-portrait": { widthKm: 20, heightKm: 30 },
+  panorama: { widthKm: 60, heightKm: 15 },
+};
+
+function bboxAroundCenterKm(
+  center: { lat: number; lon: number },
+  widthKm: number,
+  heightKm: number,
+): [number, number, number, number] {
+  const earthRadiusKm = 6371;
+  const latRad = (center.lat * Math.PI) / 180;
+
+  const dLat = (heightKm / earthRadiusKm) * (180 / Math.PI);
+  const dLon = ((widthKm / earthRadiusKm) * (180 / Math.PI)) / Math.cos(latRad || 1e-6);
+
+  const south = center.lat - dLat / 2;
+  const north = center.lat + dLat / 2;
+  const west = center.lon - dLon / 2;
+  const east = center.lon + dLon / 2;
+
+  return [west, south, east, north];
+}
+
 function PlaygroundInner() {
   const search = useSearchParams();
   const router = useRouter();
   const [selectedThemeId, setSelectedThemeId] = useState<ThemeId>(DEFAULT_THEME);
-  const [selectedPresetId, setSelectedPresetId] = useState<ProductPresetId | null>("square");
+  const [selectedPresetId, setSelectedPresetId] = useState<ProductPresetId | null>(null);
   const [center, setCenter] = useState(DEFAULT_CENTER);
   const [aoiBounds, setAoiBounds] = useState<[number, number, number, number] | null>(null);
-  const [mapBounds, setMapBounds] = useState<[number, number, number, number] | null>(null);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
   const [previewBounds, setPreviewBounds] = useState<[number, number, number, number] | null>(null);
   const [loading, setLoading] = useState(false);
   const [flyTarget, setFlyTarget] = useState<{ lat: number; lon: number; token: number } | null>(null);
-  const [drawCommand, setDrawCommand] = useState(0);
-  const [clearCommand, setClearCommand] = useState(0);
+  const [initializedFromUrl, setInitializedFromUrl] = useState(false);
   const presets = useMemo(() => getPresets(), []);
+  const activePresetSpec = selectedPresetId ? PRESET_SPECS[selectedPresetId] : null;
   const handleClearPreview = useCallback(() => setPreviewImageUrl(null), []);
 
   useEffect(() => {
+    if (initializedFromUrl) return;
     const lat = parseFloat(search.get("lat") || `${DEFAULT_CENTER.lat}`);
     const lon = parseFloat(search.get("lon") || `${DEFAULT_CENTER.lon}`);
     const preset = (search.get("preset") as ProductPresetId | null) || null;
@@ -37,27 +64,24 @@ function PlaygroundInner() {
     setCenter(centerVal);
     setFlyTarget({ lat, lon, token: Date.now() });
     if (preset) {
-      setSelectedPresetId(preset);
+      const spec = PRESET_SPECS[preset];
+      if (spec) {
+        const bbox = bboxAroundCenterKm(centerVal, spec.widthKm, spec.heightKm);
+        setSelectedPresetId(preset);
+        setAoiBounds(bbox);
+      } else {
+        setSelectedPresetId(null);
+      }
     } else {
-      setSelectedPresetId((prev) => prev ?? "square");
+      setSelectedPresetId(null);
     }
-  }, [search]);
+    setInitializedFromUrl(true);
+  }, [initializedFromUrl, search]);
 
   useEffect(() => {
     if (!selectedPresetId) return;
-    const preset = presets.find((p) => p.id === selectedPresetId);
-    if (!preset) return;
-    const feature = createAoiPolygonFromPreset(preset, selectedThemeId, center.lon, center.lat);
-    const bbox = bboxFromFeature(feature);
-    setAoiBounds(bbox);
-  }, [center.lat, center.lon, presets, selectedPresetId, selectedThemeId]);
-
-  useEffect(() => {
-    if (mapBounds) {
-      const c = { lat: (mapBounds[1] + mapBounds[3]) / 2, lon: (mapBounds[0] + mapBounds[2]) / 2 };
-      setCenter(c);
-    }
-  }, [mapBounds]);
+    // No-op while a preset is active; aoiBounds is driven by PreviewPane via onAoiBoundsChange.
+  }, [selectedPresetId]);
 
   const handleRender = async () => {
     if (!selectedPresetId || !aoiBounds) return;
@@ -107,15 +131,22 @@ function PlaygroundInner() {
         {presets.map((p) => (
           <button
             key={p.id}
-            className={`preset-card ${selectedPresetId === p.id ? "active" : ""}`}
-            onClick={() => {
+          className={`preset-card ${selectedPresetId === p.id ? "active" : ""}`}
+          onClick={() => {
+            if (selectedPresetId === p.id) {
+              setSelectedPresetId(null);
+              setAoiBounds(null);
+              setPreviewImageUrl(null);
+              setPreviewBounds(null);
+              return;
+            }
+            const spec = PRESET_SPECS[p.id];
+            if (!spec) return;
+            const bbox = bboxAroundCenterKm(center, spec.widthKm, spec.heightKm);
               setSelectedPresetId(p.id);
-              const presetDef = presets.find((x) => x.id === p.id);
-              if (presetDef) {
-                const feature = createAoiPolygonFromPreset(presetDef, selectedThemeId, center.lon, center.lat);
-                const bbox = bboxFromFeature(feature);
-                setAoiBounds(bbox);
-              }
+              setAoiBounds(bbox);
+              setPreviewImageUrl(null);
+              setPreviewBounds(null);
             }}
           >
             <div className="outline" style={{ aspectRatio: `${p.aspectRatio}` }} />
@@ -132,20 +163,23 @@ function PlaygroundInner() {
         </button>
       </aside>
       <div className="map-area">
-          <PreviewPane
-            selectedSizeKm={20}
-            sizeCommand={null}
-            drawCommand={drawCommand}
-            clearCommand={clearCommand}
-            flyToTarget={flyTarget}
-            previewImageUrl={previewImageUrl}
-            previewBounds={previewBounds}
-            presetBounds={aoiBounds}
+        <PreviewPane
+          selectedSizeKm={20}
+          sizeCommand={null}
+          flyToTarget={flyTarget}
+          previewImageUrl={previewImageUrl}
+          previewBounds={previewBounds}
+          presetBounds={aoiBounds}
+          activePresetId={selectedPresetId}
+          presetAspect={activePresetSpec ? activePresetSpec.widthKm / activePresetSpec.heightKm : null}
           loading={loading}
           sceneInfo={undefined}
           showSelection={true}
           basemap="imagery"
-          onBoundsChange={undefined}
+            onMapCenterChange={(c) => {
+              if (!selectedPresetId) setCenter(c);
+            }}
+          onFlyComplete={() => setFlyTarget(null)}
           onAoiBoundsChange={setAoiBounds}
           onClearPreview={handleClearPreview}
           onSizeCommandHandled={() => null}
