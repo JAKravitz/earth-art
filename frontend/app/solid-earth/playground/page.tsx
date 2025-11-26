@@ -1,13 +1,12 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import PreviewPane from "../../components/PreviewPane";
 import { getPresets, ProductPresetId } from "../../config/aoiPresets";
 import { THEMES, getFiltersForTheme, ThemeId } from "../../config/themesAndFilters";
 import { createAoiPolygonFromPreset, bboxFromFeature } from "../../utils/aoiFromPreset";
 import { fetchBatchPreviews, BatchPreviewRequest } from "../../api";
-import { useEarthsySession } from "../../context/EarthsySession";
 import SearchBar from "../../components/SearchBar";
 
 const DEFAULT_CENTER = { lat: 32.7157, lon: -117.1611 };
@@ -16,18 +15,8 @@ const DEFAULT_THEME: ThemeId = "earth-science";
 function PlaygroundInner() {
   const search = useSearchParams();
   const router = useRouter();
-  const {
-    setProduct,
-    setTheme,
-    setCenter: setCtxCenter,
-    setPreset: setCtxPreset,
-    setAoi,
-    setPreviews,
-    setSelectedFilterId: setCtxSelectedFilterId,
-    presetId: sessionPreset,
-  } = useEarthsySession();
   const [selectedThemeId, setSelectedThemeId] = useState<ThemeId>(DEFAULT_THEME);
-  const [selectedPresetId, setSelectedPresetId] = useState<ProductPresetId | null>(sessionPreset ?? "square");
+  const [selectedPresetId, setSelectedPresetId] = useState<ProductPresetId | null>("square");
   const [center, setCenter] = useState(DEFAULT_CENTER);
   const [aoiBounds, setAoiBounds] = useState<[number, number, number, number] | null>(null);
   const [mapBounds, setMapBounds] = useState<[number, number, number, number] | null>(null);
@@ -35,25 +24,24 @@ function PlaygroundInner() {
   const [previewBounds, setPreviewBounds] = useState<[number, number, number, number] | null>(null);
   const [loading, setLoading] = useState(false);
   const [flyTarget, setFlyTarget] = useState<{ lat: number; lon: number; token: number } | null>(null);
+  const [drawCommand, setDrawCommand] = useState(0);
+  const [clearCommand, setClearCommand] = useState(0);
   const presets = useMemo(() => getPresets(), []);
+  const handleClearPreview = useCallback(() => setPreviewImageUrl(null), []);
 
   useEffect(() => {
-    setProduct("solid-earth");
-    setTheme("earth-science");
     const lat = parseFloat(search.get("lat") || `${DEFAULT_CENTER.lat}`);
     const lon = parseFloat(search.get("lon") || `${DEFAULT_CENTER.lon}`);
     const preset = (search.get("preset") as ProductPresetId | null) || null;
-    setCenter({ lat, lon });
-    setCtxCenter({ lat, lon });
+    const centerVal = { lat, lon };
+    setCenter(centerVal);
     setFlyTarget({ lat, lon, token: Date.now() });
     if (preset) {
       setSelectedPresetId(preset);
-      setCtxPreset(preset);
     } else {
       setSelectedPresetId((prev) => prev ?? "square");
-      setCtxPreset(sessionPreset ?? "square");
     }
-  }, [search, sessionPreset, setCtxCenter, setCtxPreset, setProduct, setTheme]);
+  }, [search]);
 
   useEffect(() => {
     if (!selectedPresetId) return;
@@ -62,16 +50,14 @@ function PlaygroundInner() {
     const feature = createAoiPolygonFromPreset(preset, selectedThemeId, center.lon, center.lat);
     const bbox = bboxFromFeature(feature);
     setAoiBounds(bbox);
-    setCtxPreset(selectedPresetId);
-    setAoi(feature, bbox);
-  }, [center.lat, center.lon, presets, selectedPresetId, selectedThemeId, setAoi, setCtxPreset]);
+  }, [center.lat, center.lon, presets, selectedPresetId, selectedThemeId]);
 
   useEffect(() => {
-    // fly when search or preset initializes
-    if (selectedPresetId && center) {
-      setFlyTarget({ lat: center.lat, lon: center.lon, token: Date.now() });
+    if (mapBounds) {
+      const c = { lat: (mapBounds[1] + mapBounds[3]) / 2, lon: (mapBounds[0] + mapBounds[2]) / 2 };
+      setCenter(c);
     }
-  }, [center.lat, center.lon, selectedPresetId]);
+  }, [mapBounds]);
 
   const handleRender = async () => {
     if (!selectedPresetId || !aoiBounds) return;
@@ -94,12 +80,6 @@ function PlaygroundInner() {
         const first = res.results[0];
         setPreviewImageUrl(`data:image/png;base64,${first.png_base64}`);
         setPreviewBounds(first.bbox);
-        const map = res.results.reduce<Record<string, { imageUrl: string; filterId: string }>>((acc, r) => {
-          acc[r.id] = { imageUrl: `data:image/png;base64,${r.png_base64}`, filterId: r.id };
-          return acc;
-        }, {});
-        setPreviews(map);
-        setCtxSelectedFilterId(first.id);
       }
       router.push("/solid-earth/editor");
     } catch (err) {
@@ -119,7 +99,6 @@ function PlaygroundInner() {
             onSelect={(lat, lon) => {
               const next = { lat, lon };
               setCenter(next);
-              setCtxCenter(next);
               setFlyTarget({ lat, lon, token: Date.now() });
             }}
           />
@@ -131,7 +110,12 @@ function PlaygroundInner() {
             className={`preset-card ${selectedPresetId === p.id ? "active" : ""}`}
             onClick={() => {
               setSelectedPresetId(p.id);
-              setCtxPreset(p.id);
+              const presetDef = presets.find((x) => x.id === p.id);
+              if (presetDef) {
+                const feature = createAoiPolygonFromPreset(presetDef, selectedThemeId, center.lon, center.lat);
+                const bbox = bboxFromFeature(feature);
+                setAoiBounds(bbox);
+              }
             }}
           >
             <div className="outline" style={{ aspectRatio: `${p.aspectRatio}` }} />
@@ -148,22 +132,22 @@ function PlaygroundInner() {
         </button>
       </aside>
       <div className="map-area">
-        <PreviewPane
-          selectedSizeKm={20}
-          sizeCommand={null}
-          drawCommand={0}
-          clearCommand={0}
-          flyToTarget={flyTarget}
-          previewImageUrl={previewImageUrl}
-          previewBounds={previewBounds}
-          presetBounds={aoiBounds}
+          <PreviewPane
+            selectedSizeKm={20}
+            sizeCommand={null}
+            drawCommand={drawCommand}
+            clearCommand={clearCommand}
+            flyToTarget={flyTarget}
+            previewImageUrl={previewImageUrl}
+            previewBounds={previewBounds}
+            presetBounds={aoiBounds}
           loading={loading}
           sceneInfo={undefined}
           showSelection={true}
           basemap="imagery"
-          onBoundsChange={setMapBounds}
+          onBoundsChange={undefined}
           onAoiBoundsChange={setAoiBounds}
-          onClearPreview={() => setPreviewImageUrl(null)}
+          onClearPreview={handleClearPreview}
           onSizeCommandHandled={() => null}
         />
       </div>

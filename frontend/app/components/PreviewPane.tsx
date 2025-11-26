@@ -59,6 +59,8 @@ const BASEMAP_STYLES: Record<BasemapMode, StyleSpecification | string> = {
 
 const PREVIEW_SOURCE_ID = "preview-image-source";
 const PREVIEW_LAYER_ID = "preview-image-layer";
+const AOI_SOURCE_ID = "aoi-outline-source";
+const AOI_LAYER_ID = "aoi-outline-layer";
 
 function kmToZoom(widthKm: number, mapWidthPx: number, latitude: number): number {
   const widthM = widthKm * 1000;
@@ -102,6 +104,8 @@ export default function PreviewPane({
   const [latestBounds, setLatestBounds] = useState<AoiBounds | null>(null);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const flyTokenRef = useRef<number | null>(null);
+  const prevDrawCommandRef = useRef<number | null>(null);
+  const prevPresetBoundsRef = useRef<AoiBounds | null>(null);
 
   const previewBoundsObj = useMemo(() => {
     if (!previewBounds) return null;
@@ -211,15 +215,14 @@ export default function PreviewPane({
 
   const handleMapMove = useCallback(
     (_evt: maplibregl.MapMouseEvent) => {
+      // no-op for now to avoid render loops
       const map = mapRef.current;
       if (!map) return;
       const { lat, lng } = map.getCenter();
       const zoom = map.getZoom();
-      setViewState({ latitude: lat, longitude: lng, zoom });
       viewStateRef.current = { latitude: lat, longitude: lng, zoom };
-      syncAoiOverlayToBounds();
     },
-    [syncAoiOverlayToBounds],
+    [],
   );
 
   useEffect(() => {
@@ -230,83 +233,131 @@ export default function PreviewPane({
     aoiRectRef.current = aoiRect;
   }, [aoiRect]);
 
-  useEffect(() => {
-    latestBoundsRef.current = activeBounds ?? null;
-    if (mapReady) {
-      syncAoiOverlayToBounds();
-    }
-  }, [activeBounds, mapReady, syncAoiOverlayToBounds]);
-
-  useEffect(() => {
-    if (!presetBoundsObj || !mapReady) return;
-    latestBoundsRef.current = presetBoundsObj;
-    setLatestBounds(presetBoundsObj);
-    const rect = projectBoundsToRect(presetBoundsObj);
-    if (rect) {
-      setAoiRect(rect);
-    }
-  }, [mapReady, presetBoundsObj, projectBoundsToRect]);
-
+  const updateAoiLayer = useCallback(
+    (bounds: AoiBounds | null) => {
+      const map = mapRef.current;
+      if (!map || !bounds) return;
+      const poly = {
+        type: "Feature",
+        geometry: {
+          type: "Polygon",
+          coordinates: [
+            [
+              [bounds.west, bounds.south],
+              [bounds.east, bounds.south],
+              [bounds.east, bounds.north],
+              [bounds.west, bounds.north],
+              [bounds.west, bounds.south],
+            ],
+          ],
+        },
+        properties: {},
+      } as any;
+      let src = map.getSource(AOI_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+      if (!src) {
+        map.addSource(AOI_SOURCE_ID, { type: "geojson", data: poly });
+        map.addLayer({
+          id: AOI_LAYER_ID,
+          type: "line",
+          source: AOI_SOURCE_ID,
+          paint: { "line-color": "#ff4d4f", "line-width": 3 },
+        });
+      } else {
+        src.setData(poly);
+      }
+    },
+    [],
+  );
 
   const ensureZoomEnabled = useCallback(() => {
     const map = mapRef.current;
     if (!map) return;
+    map.dragPan.enable();
     map.scrollZoom.enable();
     map.doubleClickZoom.enable();
     map.touchZoomRotate.enable();
     map.boxZoom.enable();
   }, []);
 
-  const applyFlyTo = useCallback(() => {
-    if (!mapRef.current || !flyToTarget) return;
+  const toggleMapInteractions = useCallback((_enable: boolean) => {
     const map = mapRef.current;
-    flyTokenRef.current = flyToTarget.token;
-    setViewState((prev) => ({ ...prev, latitude: flyToTarget.lat, longitude: flyToTarget.lon }));
-    ensureZoomEnabled();
-    map.easeTo({
-      center: [flyToTarget.lon, flyToTarget.lat],
-      zoom: viewState.zoom,
-      duration: 0,
-    });
-  }, [ensureZoomEnabled, flyToTarget, viewState.zoom]);
+    if (!map) return;
+    // Always enable interactions; we no longer disable them to avoid blocking pan/zoom
+    map.dragPan.enable();
+    map.scrollZoom.enable();
+    map.doubleClickZoom.enable();
+    map.touchZoomRotate.enable();
+    map.boxZoom.enable();
+  }, []);
+
+  // sync AOI when preset bounds change
+  useEffect(() => {
+    if (!presetBoundsObj || !mapReady) return;
+    const prev = prevPresetBoundsRef.current;
+    if (
+      prev &&
+      prev.west === presetBoundsObj.west &&
+      prev.south === presetBoundsObj.south &&
+      prev.east === presetBoundsObj.east &&
+      prev.north === presetBoundsObj.north
+    ) {
+      return;
+    }
+    prevPresetBoundsRef.current = presetBoundsObj;
+    setIsDrawing(false);
+    setIsDragging(false);
+    dragStartRef.current = null;
+    toggleMapInteractions(true);
+    latestBoundsRef.current = presetBoundsObj;
+    setLatestBounds(presetBoundsObj);
+    updateAoiLayer(presetBoundsObj);
+    const rect = projectBoundsToRect(presetBoundsObj);
+    if (rect) {
+      setAoiRect(rect);
+    }
+  }, [mapReady, presetBoundsObj, projectBoundsToRect, updateAoiLayer]);
 
   useEffect(() => {
     if (!mapCanvasRef.current || mapRef.current) return;
     const map = new maplibregl.Map({
       container: mapCanvasRef.current,
-      style: BASEMAP_STYLES[basemap],
+      style: BASEMAP_STYLES[basemapRef.current],
       center: [DEFAULT_VIEW.longitude, DEFAULT_VIEW.latitude],
       zoom: DEFAULT_VIEW.zoom,
       fadeDuration: 0,
     });
     mapRef.current = map;
+    (window as any).__MAP = map;
 
     map.on("load", () => {
       setMapReady(true);
+      if (!map.getSource(AOI_SOURCE_ID)) {
+        map.addSource(AOI_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+      }
+      if (!map.getLayer(AOI_LAYER_ID)) {
+        map.addLayer({
+          id: AOI_LAYER_ID,
+          type: "line",
+          source: AOI_SOURCE_ID,
+          paint: { "line-color": "#ff4d4f", "line-width": 3 },
+        });
+      }
       map.dragPan.enable();
       map.scrollZoom.enable();
       map.doubleClickZoom.enable();
       map.touchZoomRotate.enable();
       map.boxZoom.enable();
-      if (onBoundsChange) {
-        const b = map.getBounds();
-        onBoundsChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
-      }
       syncViewFromMap();
     });
-    map.on("move", handleMapMove);
-    map.on("moveend", () => {
-      if (onBoundsChange) {
-        const b = map.getBounds();
-        onBoundsChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
-      }
-      const rect = aoiRectRef.current;
-      if (rect && !previewImageUrl) {
-        const bounds = computeBounds(rect);
-        if (bounds) pushBounds(bounds);
-      }
-    });
-  }, [basemap, computeBounds, handleMapMove, onBoundsChange, previewImageUrl, pushBounds, syncViewFromMap]);
+
+    return () => {
+      map.remove();
+      mapRef.current = null;
+    };
+  }, [syncViewFromMap]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -314,7 +365,9 @@ export default function PreviewPane({
     if (basemapRef.current === basemap) return;
     basemapRef.current = basemap;
     map.setStyle(BASEMAP_STYLES[basemap]);
-  }, [basemap]);
+    const reenable = () => ensureZoomEnabled();
+    map.once("styledata", reenable);
+  }, [basemap, ensureZoomEnabled]);
 
   const applyPreviewLayer = useCallback(() => {
     const map = mapRef.current;
@@ -347,6 +400,7 @@ export default function PreviewPane({
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
+    updateAoiLayer(activeBounds ?? latestBoundsRef.current);
     if (!previewImageUrl || !activeBounds) {
       removePreviewLayer();
       return;
@@ -359,38 +413,39 @@ export default function PreviewPane({
       };
     }
     applyPreviewLayer();
-  }, [activeBounds, applyPreviewLayer, previewImageUrl, removePreviewLayer]);
+  }, [activeBounds, applyPreviewLayer, previewImageUrl, removePreviewLayer, updateAoiLayer]);
 
   useEffect(() => {
     syncAoiOverlayToBounds();
-  }, [latestBounds, syncAoiOverlayToBounds]);
+  }, [activeBounds, mapReady, syncAoiOverlayToBounds]);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    map.on("move", syncAoiOverlayToBounds);
-    map.on("resize", syncAoiOverlayToBounds);
+    const handler = () => syncAoiOverlayToBounds();
+    map.on("move", handler);
+    map.on("resize", handler);
     return () => {
-      map.off("move", syncAoiOverlayToBounds);
-      map.off("resize", syncAoiOverlayToBounds);
+      map.off("move", handler);
+      map.off("resize", handler);
     };
   }, [syncAoiOverlayToBounds]);
 
 
   useEffect(() => {
-    applyFlyTo();
-  }, [applyFlyTo, flyToTarget]);
-
-  const toggleMapInteractions = useCallback((enable: boolean) => {
+    if (!mapRef.current || !flyToTarget) return;
+    if (flyTokenRef.current === flyToTarget.token) return;
+    flyTokenRef.current = flyToTarget.token;
     const map = mapRef.current;
-    if (!map) return;
-    // Always enable interactions; we no longer disable them to avoid blocking pan/zoom
-    map.dragPan.enable();
-    map.scrollZoom.enable();
-    map.doubleClickZoom.enable();
-    map.touchZoomRotate.enable();
-    map.boxZoom.enable();
-  }, []);
+    const zoom = map.getZoom();
+    setViewState({ latitude: flyToTarget.lat, longitude: flyToTarget.lon, zoom });
+    ensureZoomEnabled();
+    map.easeTo({
+      center: [flyToTarget.lon, flyToTarget.lat],
+      zoom,
+      duration: 0,
+    });
+  }, [ensureZoomEnabled, flyToTarget]);
 
   useEffect(() => {
     if (sizeCommand == null) return;
@@ -508,12 +563,10 @@ export default function PreviewPane({
     [finalizeAoi, isDragging, isDrawing, updateRectFromClient],
   );
 
-  const drawInitRef = useRef(false);
   useEffect(() => {
-    if (!drawInitRef.current) {
-      drawInitRef.current = true;
-      return;
-    }
+    if (drawCommand == null) return;
+    if (prevDrawCommandRef.current === drawCommand) return;
+    prevDrawCommandRef.current = drawCommand;
     if (drawCommand <= 0) return;
     clearAoi("draw command start");
     setIsDrawing(true);
@@ -522,18 +575,17 @@ export default function PreviewPane({
     toggleMapInteractions(false);
   }, [clearAoi, drawCommand, toggleMapInteractions]);
 
-  const clearInitRef = useRef(false);
+  const prevClearCommandRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!clearInitRef.current) {
-      clearInitRef.current = true;
-      return;
-    }
+    if (clearCommand == null) return;
+    if (prevClearCommandRef.current === clearCommand) return;
+    prevClearCommandRef.current = clearCommand;
     clearAoi("external clear command");
     setIsDrawing(false);
     setIsDragging(false);
     dragStartRef.current = null;
     toggleMapInteractions(true);
-  }, [clearAoi, clearCommand, toggleMapInteractions]);
+  }, [clearCommand, clearAoi, toggleMapInteractions]);
 
   const aoiBorder = useMemo(() => {
     if (!aoiRect) return null;
@@ -560,15 +612,11 @@ export default function PreviewPane({
       {aoiBorder}
       <div
         className="draw-overlay"
-        onMouseDown={handleOverlayMouseDown}
-        onMouseMove={handleOverlayMouseMove}
-        onMouseUp={handleOverlayMouseUp}
-        onMouseLeave={handleOverlayMouseLeave}
         style={{
           position: "absolute",
           inset: 0,
-          cursor: isDrawing ? "crosshair" : "default",
-          pointerEvents: isDrawing ? "auto" : "none",
+          cursor: "default",
+          pointerEvents: "none",
           background: "transparent",
         }}
       />
