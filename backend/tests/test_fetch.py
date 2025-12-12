@@ -17,14 +17,19 @@ class DummyAsset:
 
 
 class DummyItem:
-    def __init__(self, bands):
-        self.id = "dummy-scene"
+    def __init__(self, bands, scene_id: str = "dummy-scene", datatake: str = "2024-01-01T00:00:00Z"):
+        self.id = scene_id
         self.collection_id = "sentinel-2-l2a"
         self.geometry = {
             "type": "Polygon",
             "coordinates": [[[-118, 32], [-118, 34], [-116, 34], [-116, 32], [-118, 32]]],
         }
-        self.properties = {"proj:epsg": 32611, "datetime": "2024-01-01T00:00:00Z", "eo:cloud_cover": 5}
+        self.properties = {
+            "proj:epsg": 32611,
+            "datetime": datatake,
+            "eo:cloud_cover": 5,
+            "sentinel:datatake_start_time": datatake,
+        }
         self.assets = {band: DummyAsset(scale=0.0001) for band in bands}
 
 
@@ -152,3 +157,29 @@ def test_get_resampling_env(monkeypatch):
     assert fetch.get_resampling("nearest").name == "nearest"
     assert fetch.get_resampling("BILINEAR").name == "bilinear"
     assert fetch.get_resampling("unknown").name == "bilinear"
+
+
+def test_find_scenes_prioritizes_shared_datatake(monkeypatch):
+    aoi = (-117.5, 32.5, -116.5, 33.5)
+    scene_a = DummyItem(["B04"], scene_id="scene-a", datatake="2024-01-01T10:00:00Z")
+    scene_b = DummyItem(["B04"], scene_id="scene-b", datatake="2024-01-01T10:00:00Z")
+    scene_c = DummyItem(["B04"], scene_id="scene-c", datatake="2024-01-02T10:00:00Z")
+
+    class DummySearch:
+        def __init__(self, items):
+            self._items = items
+
+        def items(self):
+            return self._items
+
+    class DummyClient:
+        def __init__(self, items):
+            self._items = items
+
+        def search(self, **kwargs):
+            return DummySearch(self._items)
+
+    monkeypatch.setattr(fetch.Client, "open", lambda *args, **kwargs: DummyClient([scene_a, scene_b, scene_c]))
+
+    results = fetch.find_scenes_for_aoi(aoi_bounds=aoi, max_scenes=3)
+    assert [selection.item.id for selection in results] == ["scene-a", "scene-b"]

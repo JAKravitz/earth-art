@@ -14,9 +14,15 @@ frontend/         # Next.js UI
 
 ```bash
 cd earth-art/backend
-python -m venv .venv
+# Use Python 3.11/3.12 (concrete wheels are available via conda-forge; 3.13
+# may still miss PyPI wheels for rasterio)
+python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+
+# macOS system deps (Intel/ARM):
+#   brew install gdal geos proj
+pip install -r requirements.txt   # pulls rasterio wheels from conda-forge for 3.13
+
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 

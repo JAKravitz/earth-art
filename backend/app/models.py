@@ -76,6 +76,7 @@ class PreviewRequest(BaseModel):
     lat: float = Field(..., ge=-90.0, le=90.0)
     lon: float = Field(..., ge=-180.0, le=180.0)
     size_km: float = Field(10.0, ge=1.0, le=50.0)
+    aoi_bounds: Optional[List[float]] = Field(default=None, description="Optional AOI bbox [w, s, e, n]")
     theme: ThemeLiteral = "true"
     overlays: OverlayOptions | Dict[str, bool] = Field(default_factory=OverlayOptions)
     date_range: Optional[DateRange] = None

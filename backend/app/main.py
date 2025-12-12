@@ -24,7 +24,7 @@ from app.processing.fetch import SceneNotFoundError, SceneSearchError, SceneVali
 from app.processing.filters import render_filter
 
 LOGGER = logging.getLogger(__name__)
-PREVIEW_MAX_PX = int(os.getenv("PREVIEW_MAX_PX", "512"))
+PREVIEW_MAX_PX = int(os.getenv("PREVIEW_MAX_PX", "2048"))
 PREVIEW_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(4, min(8, os.cpu_count() or 4)),
     thread_name_prefix="preview",
@@ -90,6 +90,7 @@ def _run_pipeline(request: PreviewRequest, target_pixels: int):
             request.theme,
             target_pixels,
             date_range=_date_range(request),
+            aoi_bounds=tuple(request.aoi_bounds) if request.aoi_bounds else None,
         )
     except SceneNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -150,7 +151,14 @@ def export(request: ExportRequest) -> Response:
     )
 
 
-def _prepare_stack_for_filters(lat: float, lon: float, size_km: float, pixels: int, date_range: str | None):
+def _prepare_stack_for_filters(
+    lat: float,
+    lon: float,
+    size_km: float,
+    pixels: int,
+    date_range: str | None,
+    aoi_bounds: tuple[float, float, float, float] | None,
+):
     return fetch.fetch_raster_stack(
         lat,
         lon,
@@ -158,6 +166,7 @@ def _prepare_stack_for_filters(lat: float, lon: float, size_km: float, pixels: i
         "pca",
         pixels,
         date_range=date_range,
+        aoi_bounds=aoi_bounds,
     )
 
 
@@ -170,7 +179,12 @@ def batch_preview(request: BatchPreviewRequest) -> BatchPreviewResponse:
             request.size_km,
             request.target_size_px,
             date_range=_date_range(request),
+            aoi_bounds=tuple(request.aoi_bounds) if request.aoi_bounds else None,
         )
+        # Ensure previews reuse an in-memory stack instead of recomputing dask
+        # graphs per filter, which can time out and yield black placeholders.
+        if hasattr(stack.data, "compute"):
+            stack = stack.copy(data=stack.data.compute())
     except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -191,7 +205,7 @@ def batch_preview(request: BatchPreviewRequest) -> BatchPreviewResponse:
     futures = {PREVIEW_EXECUTOR.submit(_render_one, spec): spec.id for spec in request.filters}
     completed: set[str] = set()
     try:
-        for fut in as_completed(futures, timeout=20):
+        for fut in as_completed(futures, timeout=60):
             fid = futures[fut]
             completed.add(fid)
             results.append(fut.result())
@@ -228,6 +242,7 @@ def export_filter(request: ExportFilterRequest) -> Response:
             request.size_km,
             request.target_size_px,
             date_range=_date_range(request),
+            aoi_bounds=tuple(request.aoi_bounds) if request.aoi_bounds else None,
         )
     except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

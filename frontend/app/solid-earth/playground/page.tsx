@@ -7,6 +7,7 @@ import { getPresets, ProductPresetId } from "../../config/aoiPresets";
 import { THEMES, getFiltersForTheme, ThemeId } from "../../config/themesAndFilters";
 import { fetchBatchPreviews, BatchPreviewRequest } from "../../api";
 import SearchBar from "../../components/SearchBar";
+import { useEarthsySession } from "../../context/EarthsySession";
 
 const DEFAULT_CENTER = { lat: 32.7157, lon: -117.1611 };
 const DEFAULT_THEME: ThemeId = "earth-science";
@@ -19,6 +20,11 @@ const PRESET_SPECS: Record<ProductPresetId, PresetSizeSpec> = {
   "poster-portrait": { widthKm: 20, heightKm: 30 },
   panorama: { widthKm: 60, heightKm: 15 },
 };
+
+function centerFromBounds(bbox: [number, number, number, number]) {
+  const [west, south, east, north] = bbox;
+  return { lat: (south + north) / 2, lon: (west + east) / 2 };
+}
 
 function bboxAroundCenterKm(
   center: { lat: number; lon: number },
@@ -42,6 +48,17 @@ function bboxAroundCenterKm(
 function PlaygroundInner() {
   const search = useSearchParams();
   const router = useRouter();
+  const {
+    setProduct,
+    setTheme,
+    setCenter: setSessionCenter,
+    setPreset,
+    setAoi,
+    setPreviews,
+    setSelectedFilterId,
+    previewsByFilterId,
+    hydrated,
+  } = useEarthsySession();
   const [selectedThemeId, setSelectedThemeId] = useState<ThemeId>(DEFAULT_THEME);
   const [selectedPresetId, setSelectedPresetId] = useState<ProductPresetId | null>(null);
   const [center, setCenter] = useState(DEFAULT_CENTER);
@@ -49,6 +66,8 @@ function PlaygroundInner() {
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
   const [previewBounds, setPreviewBounds] = useState<[number, number, number, number] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [readyForEditor, setReadyForEditor] = useState(false);
   const [flyTarget, setFlyTarget] = useState<{ lat: number; lon: number; token: number } | null>(null);
   const [initializedFromUrl, setInitializedFromUrl] = useState(false);
   const presets = useMemo(() => getPresets(), []);
@@ -85,33 +104,75 @@ function PlaygroundInner() {
 
   const handleRender = async () => {
     if (!selectedPresetId || !aoiBounds) return;
+    const presetSpec = PRESET_SPECS[selectedPresetId];
+    const maxSideKm = presetSpec ? Math.max(presetSpec.widthKm, presetSpec.heightKm) : 20;
+    const targetPx = Math.max(640, Math.min(2048, Math.round((maxSideKm / 20) * 1024)));
+    const aoiCenter = centerFromBounds(aoiBounds);
     setLoading(true);
+    setError(null);
     setPreviewImageUrl(null);
     const filters = getFiltersForTheme(selectedThemeId);
     const payload: BatchPreviewRequest = {
-      lat: center.lat,
-      lon: center.lon,
+      lat: aoiCenter.lat,
+      lon: aoiCenter.lon,
       size_km: Math.max(...filters.map(() => 20)),
       aoi_bounds: aoiBounds,
       themeId: selectedThemeId,
       preview: true,
-      target_size_px: 320,
+      target_size_px: targetPx,
       filters: filters.map((f) => ({ id: f.id, styleType: f.styleType, params: f.params })),
     };
     try {
       const res = await fetchBatchPreviews(payload);
-      if (res.results.length) {
-        const first = res.results[0];
-        setPreviewImageUrl(`data:image/png;base64,${first.png_base64}`);
-        setPreviewBounds(first.bbox);
+      if (!res.results.length) {
+        throw new Error("No previews were returned. Please try again.");
       }
-      router.push("/solid-earth/editor");
+
+      const preferred = res.results.find((item) => item.id === "true-color") || res.results[0];
+      const referenceBbox = preferred?.bbox ?? aoiBounds;
+      const sessionCenter = referenceBbox ? centerFromBounds(referenceBbox) : aoiCenter;
+      const previewEntries = Object.fromEntries(
+        res.results.map((item) => [
+          item.id,
+          {
+            imageUrl: `data:image/png;base64,${item.png_base64}`,
+            filterId: item.id,
+            bbox: item.bbox ?? aoiBounds,
+            scene: item.scene_metadata,
+          },
+        ]),
+      );
+
+      setPreviewImageUrl(`data:image/png;base64,${preferred.png_base64}`);
+      setPreviewBounds(referenceBbox);
+
+      setProduct("solid-earth");
+      setTheme(selectedThemeId);
+      setSessionCenter(sessionCenter);
+      setPreset(selectedPresetId);
+      setAoi(null, referenceBbox);
+      setPreviews(previewEntries);
+      setSelectedFilterId(preferred.id);
+      setReadyForEditor(true);
     } catch (err) {
       console.error(err);
+      setError(err instanceof Error ? err.message : "Failed to render previews");
     } finally {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!readyForEditor || !hydrated) return;
+    const hasPreviews = Object.keys(previewsByFilterId).length > 0;
+    if (hasPreviews) {
+      router.push("/solid-earth/editor");
+      setReadyForEditor(false);
+    } else if (!loading) {
+      setError("Previews did not persist. Please try rendering again.");
+      setReadyForEditor(false);
+    }
+  }, [hydrated, loading, previewsByFilterId, readyForEditor, router]);
 
   return (
     <div className="playground">
@@ -158,6 +219,7 @@ function PlaygroundInner() {
           ))}
         </div>
         <p className="hint">Move the map to frame your artwork. We keep a wider view so prints look smooth.</p>
+        {error ? <p className="error">{error}</p> : null}
         <button className="primary" disabled={!selectedPresetId || loading} onClick={handleRender}>
           {loading ? "Rendering…" : "Render previews"}
         </button>
@@ -244,6 +306,10 @@ function PlaygroundInner() {
         }
         .hint {
           color: #94a3b8;
+          margin: 0;
+        }
+        .error {
+          color: #f87171;
           margin: 0;
         }
         .primary {

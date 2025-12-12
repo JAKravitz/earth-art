@@ -13,11 +13,46 @@ def _select(stack: xr.DataArray, bands: list[str]) -> xr.DataArray:
     return stack.sel(band=list(bands))
 
 
-def _stretch_and_gamma(data, gamma: float = 1.0, lower: float = 2.0, upper: float = 98.0) -> np.ndarray:
+def _stretch_and_gamma(
+    data,
+    gamma: float = 1.0,
+    lower: float = 2.0,
+    upper: float = 98.0,
+    white_balance: bool = False,
+    saturation: float = 1.0,
+) -> np.ndarray:
     stretched = render.apply_percentile_stretch(data, lower=lower, upper=upper)
+    if white_balance:
+        stretched = _gray_world_balance(stretched)
+    if saturation != 1.0:
+        stretched = _adjust_saturation(stretched, saturation)
     if gamma != 1.0:
         stretched = render.apply_gamma(stretched, gamma)
     return np.clip(stretched, 0, 1)
+
+
+def _gray_world_balance(arr: np.ndarray) -> np.ndarray:
+    # Simple gray-world white balance to pull true-color closer to natural tones
+    if arr.shape[0] != 3:
+        return arr
+    channel_means = np.nanmean(arr.reshape(3, -1), axis=1)
+    overall_mean = np.nanmean(channel_means) + 1e-6
+    scales = overall_mean / (channel_means + 1e-6)
+    balanced = arr * scales[:, None, None]
+    balanced = balanced / (np.nanmax(balanced) + 1e-6)
+    return balanced.astype(arr.dtype)
+
+
+def _adjust_saturation(arr: np.ndarray, factor: float) -> np.ndarray:
+    if arr.shape[0] != 3:
+        return arr
+    import skimage.color
+
+    rgb = np.transpose(arr, (1, 2, 0))
+    hsv = skimage.color.rgb2hsv(rgb)
+    hsv[..., 1] = np.clip(hsv[..., 1] * factor, 0, 1)
+    adjusted = skimage.color.hsv2rgb(hsv)
+    return np.transpose(adjusted.astype("float32"), (2, 0, 1))
 
 
 def _desert_veins(stack: xr.DataArray) -> np.ndarray:
@@ -33,9 +68,25 @@ def _desert_veins(stack: xr.DataArray) -> np.ndarray:
     return _stretch_and_gamma(cube, gamma=0.95, lower=2, upper=98)
 
 
-def _false_color(stack: xr.DataArray, bands: list[str], gamma: float = 1.0) -> np.ndarray:
+def _false_color(
+    stack: xr.DataArray,
+    bands: list[str],
+    *,
+    gamma: float = 1.0,
+    lower: float = 2.0,
+    upper: float = 98.0,
+    white_balance: bool = False,
+    saturation: float = 1.0,
+) -> np.ndarray:
     data = _select(stack, bands)
-    return _stretch_and_gamma(data, gamma=gamma)
+    return _stretch_and_gamma(
+        data,
+        gamma=gamma,
+        lower=lower,
+        upper=upper,
+        white_balance=white_balance,
+        saturation=saturation,
+    )
 
 
 def _apply_osm_overlay(
@@ -91,9 +142,25 @@ def render_filter(
     if style == "MNF":
         return compose.compose_nmf(stack, palette=str(params.get("palette", "vivid")))
     if style == "FalseColor":
-        bands = params.get("rgbBands") or params.get("inputBands") or ["B08", "B04", "B03"]
+        bands = params.get("rgbBands") or params.get("inputBands") or ["B04", "B03", "B02"]
         gamma = float(params.get("gamma", 1.0))
-        return _false_color(stack, list(bands), gamma=gamma)
+        lower = float(params.get("lower", 2.0))
+        upper = float(params.get("upper", 98.0))
+        white_balance = bool(params.get("whiteBalance", False))
+        saturation = float(params.get("saturation", 1.0))
+        if preview_mode and list(bands) == ["B08", "B04", "B03"]:
+            print(
+                "[WARN] Preview FalseColor using NIR-R-G bands; this will look false-color, not true RGB."
+            )
+        return _false_color(
+            stack,
+            list(bands),
+            gamma=gamma,
+            lower=lower,
+            upper=upper,
+            white_balance=white_balance,
+            saturation=saturation,
+        )
     if style == "DecorrelatedStretch":
         bands = params.get("inputBands") or ["B12", "B08", "B04"]
         palette = str(params.get("palette", "vivid"))

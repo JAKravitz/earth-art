@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import type { Feature, Polygon } from "geojson";
 import type { ProductPresetId } from "../config/aoiPresets";
 import type { ThemeId } from "../config/themesAndFilters";
@@ -30,6 +30,7 @@ type SessionState = {
   previewsByFilterId: Record<string, PreviewEntry>;
   selectedFilterId: string | null;
   adjustments: Adjustments;
+  hydrated: boolean;
 };
 
 type SessionActions = {
@@ -44,6 +45,8 @@ type SessionActions = {
   reset: () => void;
 };
 
+export const DEFAULT_FILTER_ID = "true-color";
+
 const DEFAULT_STATE: SessionState = {
   product: "solid-earth",
   themeId: "earth-science",
@@ -52,18 +55,48 @@ const DEFAULT_STATE: SessionState = {
   aoiFeature: null,
   aoiBounds: null,
   previewsByFilterId: {},
-  selectedFilterId: null,
+  selectedFilterId: DEFAULT_FILTER_ID,
   adjustments: { brightness: 100, contrast: 100, saturation: 100 },
+  hydrated: false,
 };
 
 const SessionContext = createContext<(SessionState & SessionActions) | null>(null);
 
 export function EarthsySessionProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<SessionState>(DEFAULT_STATE);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    try {
+      const raw = typeof window !== "undefined" ? window.localStorage.getItem("earthsy-session") : null;
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<SessionState>;
+        const { adjustments: _adj, selectedFilterId: _sel, ...rest } = parsed;
+        setState({ ...DEFAULT_STATE, ...rest, hydrated: true });
+        setHydrated(true);
+        return;
+      }
+    } catch (err) {
+      console.warn("Failed to hydrate Earthsy session", err);
+    }
+    setHydrated(true);
+    setState((prev) => ({ ...prev, hydrated: true }));
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      const { hydrated: _hydrated, adjustments: _adj, selectedFilterId: _sel, ...persistable } = state;
+      window.localStorage.setItem("earthsy-session", JSON.stringify(persistable));
+    } catch (err) {
+      console.warn("Failed to persist Earthsy session", err);
+    }
+  }, [state, hydrated]);
 
   const api = useMemo<SessionState & SessionActions>(
     () => ({
       ...state,
+      hydrated,
       setProduct: (p) => setState((prev) => ({ ...prev, product: p })),
       setTheme: (t) => setState((prev) => ({ ...prev, themeId: t })),
       setCenter: (c) => setState((prev) => ({ ...prev, center: c })),
@@ -73,7 +106,9 @@ export function EarthsySessionProvider({ children }: { children: React.ReactNode
         setState((prev) => ({
           ...prev,
           previewsByFilterId: entries,
-          selectedFilterId: Object.keys(entries)[0] ?? prev.selectedFilterId,
+          selectedFilterId: entries[DEFAULT_FILTER_ID]
+            ? DEFAULT_FILTER_ID
+            : Object.keys(entries)[0] ?? prev.selectedFilterId,
         })),
       setSelectedFilterId: (id) => setState((prev) => ({ ...prev, selectedFilterId: id })),
       setAdjustments: (adj) => setState((prev) => ({ ...prev, adjustments: { ...prev.adjustments, ...adj } })),

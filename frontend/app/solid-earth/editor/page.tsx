@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { getFilterById, getFiltersForTheme } from "../../config/themesAndFilters";
-import { useEarthsySession } from "../../context/EarthsySession";
+import { DEFAULT_FILTER_ID, useEarthsySession } from "../../context/EarthsySession";
 import { exportFilterImage } from "../../api";
 
 function bboxWidthKm(bbox: [number, number, number, number]): number {
@@ -15,23 +15,62 @@ function bboxWidthKm(bbox: [number, number, number, number]): number {
 
 export default function SolidEarthEditor() {
   const router = useRouter();
-  const { previewsByFilterId, selectedFilterId, setSelectedFilterId, adjustments, setAdjustments, aoiBounds, center } =
-    useEarthsySession();
+  const {
+    previewsByFilterId,
+    selectedFilterId,
+    setSelectedFilterId,
+    setPreviews,
+    adjustments,
+    setAdjustments,
+    aoiBounds,
+    center,
+    hydrated,
+  } = useEarthsySession();
   const filters = useMemo(() => getFiltersForTheme("earth-science"), []);
-  const currentId = selectedFilterId || Object.keys(previewsByFilterId)[0] || filters[0]?.id;
+  const preferredDefaultId = filters.find((f) => f.id === DEFAULT_FILTER_ID)?.id ?? filters[0]?.id;
+  const previewDefaultId = previewsByFilterId[DEFAULT_FILTER_ID]?.imageUrl
+    ? DEFAULT_FILTER_ID
+    : Object.keys(previewsByFilterId)[0];
+  const currentId = selectedFilterId || previewDefaultId || preferredDefaultId;
   const currentPreview = currentId ? previewsByFilterId[currentId] : undefined;
+  const [rehydrating, setRehydrating] = useState(false);
+  const DEFAULT_ADJUSTMENTS = { brightness: 100, contrast: 100, saturation: 100 };
 
   useEffect(() => {
-    if (!Object.keys(previewsByFilterId).length) {
-      router.push("/solid-earth/playground");
+    if (!hydrated || Object.keys(previewsByFilterId).length || rehydrating) {
+      return;
     }
-  }, [previewsByFilterId, router]);
+
+    const raw = typeof window !== "undefined" ? window.localStorage.getItem("earthsy-session") : null;
+    if (!raw) return;
+
+    try {
+      setRehydrating(true);
+      const parsed = JSON.parse(raw) as {
+        previewsByFilterId?: Record<string, { imageUrl: string; filterId: string }>;
+      };
+      if (parsed.previewsByFilterId && Object.keys(parsed.previewsByFilterId).length) {
+        setPreviews(parsed.previewsByFilterId);
+      }
+    } catch (err) {
+      console.warn("Failed to rehydrate previews from storage", err);
+    } finally {
+      setRehydrating(false);
+    }
+  }, [hydrated, previewsByFilterId, rehydrating, setPreviews, setSelectedFilterId]);
 
   useEffect(() => {
-    if (!selectedFilterId && Object.keys(previewsByFilterId).length) {
-      setSelectedFilterId(Object.keys(previewsByFilterId)[0]);
+    if (selectedFilterId) return;
+
+    const fallbackId =
+      (previewsByFilterId[DEFAULT_FILTER_ID]?.imageUrl && DEFAULT_FILTER_ID) ||
+      preferredDefaultId ||
+      Object.keys(previewsByFilterId)[0];
+
+    if (fallbackId) {
+      setSelectedFilterId(fallbackId);
     }
-  }, [previewsByFilterId, selectedFilterId, setSelectedFilterId]);
+  }, [previewsByFilterId, preferredDefaultId, selectedFilterId, setSelectedFilterId]);
 
   const applyCssFilter = () => {
     const { brightness, contrast, saturation } = adjustments;
@@ -73,6 +112,10 @@ export default function SolidEarthEditor() {
     }
   };
 
+  const handleResetAdjustments = () => {
+    setAdjustments(DEFAULT_ADJUSTMENTS);
+  };
+
   return (
     <div className="editor">
       <aside className="filters">
@@ -104,6 +147,9 @@ export default function SolidEarthEditor() {
       </main>
       <aside className="controls">
         <h3>Adjustments</h3>
+        <button className="refresh" type="button" onClick={handleResetAdjustments}>
+          Refresh
+        </button>
         {["brightness", "contrast", "saturation"].map((key) => (
           <label key={key}>
             {key.charAt(0).toUpperCase() + key.slice(1)} {adjustments[key as keyof typeof adjustments]}%
@@ -176,20 +222,22 @@ export default function SolidEarthEditor() {
           justify-content: center;
         }
         .image-frame {
-          width: min(90%, 900px);
+          width: min(100%, 1100px);
           background: rgba(0, 0, 0, 0.4);
           border: 1px solid rgba(255, 255, 255, 0.08);
           border-radius: 14px;
-          padding: 10px;
-          min-height: 400px;
+          padding: 16px;
+          min-height: 520px;
           display: flex;
           align-items: center;
           justify-content: center;
         }
         .image-frame img {
-          max-width: 100%;
-          max-height: 80vh;
+          width: 100%;
+          height: auto;
+          max-height: 85vh;
           border-radius: 12px;
+          object-fit: contain;
         }
         .placeholder {
           color: #94a3b8;
@@ -216,6 +264,15 @@ export default function SolidEarthEditor() {
           flex-direction: column;
           gap: 8px;
           margin-top: auto;
+        }
+        .refresh {
+          align-self: flex-start;
+          background: transparent;
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          color: #cbd5f5;
+          padding: 8px 10px;
+          border-radius: 8px;
+          cursor: pointer;
         }
         .primary,
         .ghost {

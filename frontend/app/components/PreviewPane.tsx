@@ -216,16 +216,6 @@ const PreviewPane = ({
     aoiRectRef.current = aoiRect;
   }, [aoiRect]);
 
-  const ensureZoomEnabled = useCallback(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    map.dragPan.enable();
-    map.scrollZoom.enable();
-    map.doubleClickZoom.enable();
-    map.touchZoomRotate.enable();
-    map.boxZoom.enable();
-  }, []);
-
   const setInteractionMode = useCallback((mode: "free" | "framing") => {
     const map = mapRef.current;
     if (!map) return;
@@ -243,6 +233,14 @@ const PreviewPane = ({
       map.boxZoom.disable();
     }
   }, []);
+
+  const syncInteractionMode = useCallback(() => {
+    if (aoiActiveRef.current) {
+      setInteractionMode("framing");
+    } else {
+      setInteractionMode("free");
+    }
+  }, [setInteractionMode]);
 
   useEffect(() => {
     const container = mapCanvasRef.current;
@@ -410,7 +408,7 @@ const PreviewPane = ({
     if (flyTokenRef.current === flyToTarget.token) return;
     flyTokenRef.current = flyToTarget.token;
 
-    ensureZoomEnabled();
+    syncInteractionMode();
 
     console.log("[PreviewPane] map.easeTo called", {
       center: [flyToTarget?.lon, flyToTarget?.lat],
@@ -428,7 +426,7 @@ const PreviewPane = ({
       flyTokenRef.current = flyToTarget.token;
       if (onFlyComplete) onFlyComplete();
     });
-  }, [ensureZoomEnabled, flyToTarget, mapReady, onFlyComplete]);
+  }, [flyToTarget, mapReady, onFlyComplete, syncInteractionMode]);
 
   const aoiBorder = useMemo(() => {
     if (!aoiRect || !aoiActive) return null;

@@ -52,16 +52,16 @@ def _to_band_first(arr: np.ndarray) -> np.ndarray:
 
 def apply_percentile_stretch(data, lower: float = 2.0, upper: float = 98.0) -> np.ndarray:
     arr = _to_numpy(data)
-    arr = np.nan_to_num(arr, nan=0.0)
     arr = _to_band_first(arr.astype("float32"))
     stride_y = max(1, arr.shape[1] // 1024)
     stride_x = max(1, arr.shape[2] // 1024)
     sample = arr[:, ::stride_y, ::stride_x]
-    lo = np.percentile(sample, lower, axis=(1, 2), keepdims=True)
-    hi = np.percentile(sample, upper, axis=(1, 2), keepdims=True)
+    lo = np.nanpercentile(sample, lower, axis=(1, 2), keepdims=True)
+    hi = np.nanpercentile(sample, upper, axis=(1, 2), keepdims=True)
     hi = np.where(hi - lo == 0, lo + 1e-6, hi)
     stretched = (arr - lo) / (hi - lo)
-    return np.clip(stretched, 0, 1)
+    stretched = np.clip(stretched, 0, 1)
+    return np.nan_to_num(stretched, nan=0.0, posinf=1.0, neginf=0.0)
 
 
 def apply_gamma(data: np.ndarray, gamma: float) -> np.ndarray:

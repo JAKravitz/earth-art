@@ -32,6 +32,21 @@ export const THEMES: ThemeConfig[] = [
 
 export const FILTERS: FilterConfig[] = [
   {
+    id: "true-color",
+    themeId: "earth-science",
+    name: "True Color",
+    styleType: "FalseColor",
+    description: "Natural RGB baseline with balanced stretch and neutral white balance.",
+    params: {
+      rgbBands: ["B04", "B03", "B02"],
+      lower: 2.0,
+      upper: 98.0,
+      whiteBalance: true,
+      saturation: 1.0,
+      gamma: 1.0,
+    },
+  },
+  {
     id: "aurora-pca",
     themeId: "earth-science",
     name: "Aurora PCA",
@@ -41,7 +56,7 @@ export const FILTERS: FilterConfig[] = [
       inputBands: ["B02", "B03", "B04", "B08"],
       componentsToRgb: [0, 1, 2],
       method: "pca",
-      stretch: "vivid",
+      palette: "neon",
     },
   },
   {
@@ -51,21 +66,20 @@ export const FILTERS: FilterConfig[] = [
     styleType: "FalseColor",
     description: "Classic NIR false color: pink vegetation and glowing landscapes.",
     params: {
-      rgbBands: ["B08", "B04", "B03"],
-      stretch: "soft",
-      gamma: 0.9,
+      rgbBands: ["B08", "B04", "B02"],
+      gamma: 0.82,
     },
   },
   {
     id: "basalt-glow",
     themeId: "earth-science",
     name: "Basalt Glow",
-    styleType: "FalseColor",
+    styleType: "DecorrelatedStretch",
     description: "SWIR-heavy geology look for mountains, deserts, and lava fields.",
     params: {
-      rgbBands: ["B12", "B11", "B04"],
-      stretch: "strong",
-      saturation: 0.85,
+      inputBands: ["B12", "B11", "B08"],
+      palette: "warm",
+      stretch: "vivid",
     },
   },
   {
@@ -77,7 +91,7 @@ export const FILTERS: FilterConfig[] = [
     params: {
       inputBands: ["B03", "B08", "B11"],
       method: "decorrelation",
-      palette: "neon",
+      palette: "cool",
       stretch: "vivid",
     },
   },
@@ -92,6 +106,16 @@ export const FILTERS: FilterConfig[] = [
       components: { ndvi: { num: "B08", den: "B04" }, swir1: "B11", swir2: "B12" },
       stretch: "medium",
       palette: "warm-earth",
+    },
+  },
+  {
+    id: "emerald-canopy",
+    themeId: "earth-science",
+    name: "Emerald Canopy",
+    styleType: "MNF",
+    description: "Dense vegetation punch-up with teal shadows and sunlit highlights.",
+    params: {
+      palette: "cool",
     },
   },
   {

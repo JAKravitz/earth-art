@@ -130,7 +130,7 @@ def _stabilize_sign(arr3: da.Array) -> da.Array:
 
 def _sym_scale(arr3: da.Array, p: float = 99.0) -> da.Array:
     sample = arr3[:, ::8, ::8]
-    span = da.percentile(da.fabs(sample), p, axis=(1, 2)) + 1e-6
+    span = da.nanpercentile(da.fabs(sample), p, axis=(1, 2)) + 1e-6
     return da.clip(arr3 / span[:, None, None], -1, 1)
 
 
@@ -228,10 +228,20 @@ def compose_decorr(stack: xr.DataArray, palette: str = "vivid", triplet: tuple[s
         raise ValueError(f"Missing band {exc.args[0]} for decorrelation stretch") from exc
     cube = da.stack(arrays, axis=0).astype("float32").rechunk({0: -1})
     sample = cube[:, ::8, ::8].compute().reshape(3, -1)
+    sample = sample[:, np.isfinite(sample).all(axis=0)]
+    height, width = int(stack.sizes.get("y", cube.shape[1])), int(stack.sizes.get("x", cube.shape[2]))
+    min_required = max(10, min(500, height * width))
+    if sample.shape[1] < min_required:
+        LOGGER.warning("Decorr: insufficient valid pixels; returning zeros")
+        return np.zeros((3, height, width), dtype="float32")
     mu = sample.mean(axis=1)
     centered = sample - mu[:, None]
     cov = np.cov(centered) + 1e-6 * np.eye(3)
-    lam, U = np.linalg.eigh(cov)
+    try:
+        lam, U = np.linalg.eigh(cov)
+    except np.linalg.LinAlgError:
+        LOGGER.warning("Decorr: eigenvalues failed to converge; returning zeros")
+        return np.zeros((3, height, width), dtype="float32")
     W = (U @ np.diag(1.0 / np.sqrt(lam)) @ U.T).astype("float32")
     Wd = da.from_array(W, chunks=W.shape)
     delta = cube - mu.astype("float32")[:, None, None]
@@ -323,19 +333,28 @@ def compose_pca(stack: xr.DataArray, palette: str = "vivid") -> np.ndarray:
     samples = _sample_pixels(arr, valid, max_samples=max_samples, seed=0)
 
     if samples is None or samples.shape[0] < 5000:
-        if arr.shape[1] <= 32 or arr.shape[2] <= 32:
-            fallback = arr.compute()
-        else:
-            fallback = arr[:, ::16, ::16].compute()
+        fallback = arr.compute()
         reshaped = fallback.reshape(fallback.shape[0], -1).T
         reshaped = reshaped[np.isfinite(reshaped).all(axis=1)]
         samples = reshaped
         required = min(1000, arr.shape[1] * arr.shape[2])
         if samples.shape[0] < required:
-            LOGGER.warning("PCA: insufficient valid pixels; returning zeros")
-            return np.zeros(
-                (3, bands.sizes["y"], bands.sizes["x"]), dtype="float32"
+            LOGGER.info(
+                "PCA: insufficient valid pixels; falling back to simple scaling",
+                extra={"sample_count": int(samples.shape[0]), "required": int(required)},
             )
+
+            def _scale_channelwise(img: np.ndarray) -> np.ndarray:
+                p2 = np.nanpercentile(img, 2, axis=(1, 2), keepdims=True)
+                p98 = np.nanpercentile(img, 98, axis=(1, 2), keepdims=True)
+                span = np.clip(p98 - p2, 1e-6, None)
+                scaled = np.clip((img - p2) / span, 0, 1)
+                return np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0).astype(
+                    "float32"
+                )
+
+            fallback_rgb = fallback[[2, 1, 0], :, :]
+            return _scale_channelwise(fallback_rgb)
 
     mu = samples.mean(axis=0, dtype=np.float64)
     sigma = samples.std(axis=0, dtype=np.float64) + 1e-6
