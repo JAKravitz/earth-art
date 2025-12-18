@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
 import { EarthsySessionProvider } from "./context/EarthsySession";
+import EarthsyLogo from "./components/EarthsyLogo";
 
 export const metadata: Metadata = {
   title: "Earthsy",
@@ -12,8 +13,8 @@ function TopNav() {
   return (
     <header className="top-nav">
       <div className="nav-left">
-        <Link href="/" className="brand">
-          Earthsy
+        <Link href="/" className="brand" aria-label="Earthsy home">
+          <EarthsyLogo variant="icon" priority className="brand-mark" />
         </Link>
       </div>
       <nav className="nav-links">

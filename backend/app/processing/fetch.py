@@ -15,13 +15,21 @@ from requests import exceptions as requests_exceptions
 from pyproj import Geod, Transformer
 from rasterio.enums import Resampling
 from shapely.geometry import Polygon, box, shape
-from shapely.ops import transform as shapely_transform
+from shapely.ops import transform as shapely_transform, unary_union
 import stackstac
+from scipy.ndimage import uniform_filter
 import xarray as xr
 
 DEFAULT_STAC_API = os.getenv("STAC_API_URL", "https://earth-search.aws.element84.com/v1")
+MOSAIC_MAX_SCENES = max(1, int(os.getenv("MOSAIC_MAX_SCENES", "6")))
+MOSAIC_COVERAGE_TARGET = float(os.getenv("MOSAIC_COVERAGE_TARGET", "0.98"))
+MOSAIC_MIN_EXTRA_COVERAGE = float(os.getenv("MOSAIC_MIN_EXTRA_COVERAGE", "0.15"))
+MOSAIC_NORMALIZE = os.getenv("MOSAIC_NORMALIZE", "true").lower() not in ("0", "false", "no")
 GEOD = Geod(ellps="WGS84")
 WGS84 = "EPSG:4326"
+EQUAL_AREA_CRS = "EPSG:6933"
+# Prefer a global equal-area transform for coverage calcs to avoid lat/long distortion.
+EQUAL_AREA_TRANSFORMER = Transformer.from_crs(WGS84, EQUAL_AREA_CRS, always_xy=True)
 # Prefer clearer scenes: tightened cloud limits over both windows
 SEARCH_WINDOWS = ((90, 5), (365, 20))
 LOGGER = logging.getLogger(__name__)
@@ -57,6 +65,8 @@ class SceneSelection:
     height: Optional[int] = None
     crs: Optional[str] = None
     mosaic_ids: Optional[List[str]] = None
+    coverage: Optional[float] = None
+    coverage_geom: Optional[object] = None
 
 
 def bbox_from_center(lat: float, lon: float, size_km: float) -> Tuple[float, float, float, float]:
@@ -74,6 +84,13 @@ def bbox_from_center(lat: float, lon: float, size_km: float) -> Tuple[float, flo
 def determine_utm_epsg(lat: float, lon: float) -> int:
     zone = int((lon + 180) / 6) + 1
     return 32600 + zone if lat >= 0 else 32700 + zone
+
+
+def _project_equal_area(geom: Polygon):
+    try:
+        return shapely_transform(EQUAL_AREA_TRANSFORMER.transform, geom)
+    except Exception:
+        return geom
 
 
 def project_bounds(bbox: Tuple[float, float, float, float], epsg_code: int) -> Tuple[float, float, float, float]:
@@ -195,6 +212,168 @@ def _resolve_assets(item: Item, requested: Sequence[str], prefer_gsd: int = 10) 
     return resolved, labels
 
 
+def _intersect_scene(item: Item, aoi: Polygon):
+    if not item.geometry:
+        return None
+    geom = shape(item.geometry)
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+    if not geom.intersects(aoi):
+        return None
+    intersection = geom.intersection(aoi)
+    if intersection.is_empty:
+        return None
+    projected = _project_equal_area(intersection)
+    if projected.is_empty:
+        return None
+    return projected
+
+
+def _coverage_fraction(geom, aoi_area: float) -> float:
+    if geom is None or aoi_area <= 0:
+        return 0.0
+    try:
+        return float(geom.area / aoi_area)
+    except Exception:
+        return 0.0
+
+
+def _group_coverage(selections: List[SceneSelection], aoi_area: float) -> Tuple[float, object | None]:
+    geoms = [sel.coverage_geom for sel in selections if sel.coverage_geom is not None]
+    if not geoms:
+        return 0.0, None
+    try:
+        unioned = unary_union(geoms)
+    except Exception:
+        unioned = geoms[0]
+        for geom in geoms[1:]:
+            try:
+                unioned = unioned.union(geom)
+            except Exception:
+                continue
+    return _coverage_fraction(unioned, aoi_area), unioned
+
+
+def _normalize_stack(data: da.Array, p_low: float = 2.0, p_high: float = 98.0) -> da.Array:
+    sample = data[:, ::8, ::8]
+    lo = da.nanpercentile(sample, p_low, axis=(1, 2), keepdims=True)
+    hi = da.nanpercentile(sample, p_high, axis=(1, 2), keepdims=True)
+    span = da.clip(hi - lo, 1e-6, None)
+    return da.clip((data - lo) / span, 0, 1).astype("float32")
+
+
+def _select_scenes_for_coverage(
+    selections: List[SceneSelection],
+    aoi_area: float,
+    max_scenes: int,
+) -> Tuple[List[SceneSelection], float]:
+    if not selections:
+        return [], 0.0
+
+    groups: dict[str, List[SceneSelection]] = {}
+    for sel in selections:
+        key = _datatake_key(sel.item)
+        groups.setdefault(key, []).append(sel)
+
+    group_summaries = []
+    for key, group in groups.items():
+        coverage, union_geom = _group_coverage(group, aoi_area)
+        # Sort per-group by footprint contribution so we pick the largest tiles first.
+        sorted_group = sorted(group, key=lambda s: s.coverage or 0.0, reverse=True)
+        group_summaries.append(
+            {
+                "key": key,
+                "coverage": coverage,
+                "union": union_geom,
+                "items": sorted_group,
+                "datetime": _item_datetime(group[0].item),
+            }
+        )
+
+    group_summaries.sort(key=lambda g: (g["coverage"], len(g["items"]), g["datetime"]), reverse=True)
+    limit = min(max_scenes, MOSAIC_MAX_SCENES)
+
+    # If every datatake only has a single scene, mix across datatakes up to the cap
+    # to mimic the prior behavior and avoid over-relying on one sliver.
+    if len(group_summaries) > 1 and max(len(g["items"]) for g in group_summaries) == 1:
+        selected: list[SceneSelection] = []
+        covered = None
+        for summary in group_summaries:
+            if len(selected) >= limit:
+                break
+            sel = summary["items"][0]
+            if covered is not None and _coverage_fraction(covered, aoi_area) >= MOSAIC_COVERAGE_TARGET:
+                if sel.coverage is not None and sel.coverage < MOSAIC_MIN_EXTRA_COVERAGE:
+                    continue
+            selected.append(sel)
+            geom = sel.coverage_geom
+            if geom is None:
+                continue
+            if covered is None:
+                covered = geom
+            else:
+                try:
+                    covered = covered.union(geom)
+                except Exception:
+                    covered = unary_union([covered, geom])
+        coverage = _coverage_fraction(covered, aoi_area)
+        return selected, coverage
+
+    best = group_summaries[0]
+    selected: list[SceneSelection] = []
+    covered = None
+    for sel in best["items"]:
+        if len(selected) >= limit:
+            break
+        selected.append(sel)
+        geom = sel.coverage_geom
+        if geom is None:
+            continue
+        if covered is None:
+            covered = geom
+        else:
+            try:
+                covered = covered.union(geom)
+            except Exception:
+                covered = unary_union([covered, geom])
+    coverage = _coverage_fraction(covered, aoi_area)
+    if coverage >= MOSAIC_COVERAGE_TARGET or len(group_summaries) == 1 or len(selected) >= limit:
+        return selected, coverage
+
+    extras: list[SceneSelection] = []
+    for summary in group_summaries[1:]:
+        extras.extend(summary["items"])
+    extras.sort(key=lambda s: (s.coverage or 0.0, _item_datetime(s.item)), reverse=True)
+
+    for sel in extras:
+        if len(selected) >= limit:
+            break
+        geom = sel.coverage_geom
+        if geom is None:
+            selected.append(sel)
+            continue
+        if covered is not None:
+            try:
+                incremental = geom.difference(covered)
+            except Exception:
+                incremental = geom
+            if incremental.is_empty or _coverage_fraction(incremental, aoi_area) < 0.005:
+                continue
+            try:
+                covered = covered.union(geom)
+            except Exception:
+                covered = unary_union([covered, geom])
+        else:
+            covered = geom
+        selected.append(sel)
+        coverage = _coverage_fraction(covered, aoi_area)
+        if coverage >= MOSAIC_COVERAGE_TARGET:
+            break
+
+    coverage = _coverage_fraction(covered, aoi_area)
+    return selected, coverage
+
+
 def find_scene(
     lat: float,
     lon: float,
@@ -241,6 +420,14 @@ def find_scenes_for_aoi(
     stac_api: str = DEFAULT_STAC_API,
 ) -> List[SceneSelection]:
     collection = "sentinel-2-l2a" if product == "sentinel-2" else product
+    aoi = box(*aoi_bounds)
+    aoi_equal_area = _project_equal_area(aoi)
+    aoi_area = max(aoi_equal_area.area, 1e-6)
+    all_candidates: list[SceneSelection] = []
+    best: list[SceneSelection] = []
+    best_coverage = 0.0
+    seen_ids: set[str] = set()
+
     try:
         client = Client.open(stac_api)
     except (pystac_exceptions.APIError, requests_exceptions.RequestException, OSError) as exc:
@@ -261,29 +448,38 @@ def find_scenes_for_aoi(
             query={"eo:cloud_cover": {"lt": cloud}},
             datetime=datetime_filter,
         )
-        groups: dict[str, List[SceneSelection]] = {}
+        window_candidates: list[SceneSelection] = []
         for item in search.items():
-            try:
-                _ensure_intersection(item, aoi_bounds)
-            except SceneValidationError:
+            if item.id in seen_ids:
                 continue
-            key = _datatake_key(item)
-            groups.setdefault(key, []).append(SceneSelection(item=item, bbox=aoi_bounds))
-            if sum(len(group) for group in groups.values()) >= max_scenes * 2:
+            intersection = _intersect_scene(item, aoi)
+            if intersection is None:
+                continue
+            coverage = _coverage_fraction(intersection, aoi_area)
+            selection = SceneSelection(
+                item=item,
+                bbox=aoi_bounds,
+                coverage=coverage,
+                coverage_geom=intersection,
+            )
+            window_candidates.append(selection)
+            seen_ids.add(item.id)
+            if len(window_candidates) + len(all_candidates) >= max_scenes * 2:
                 break
 
-        if not groups:
+        if not window_candidates and not all_candidates:
             continue
 
-        ordered_groups = sorted(
-            groups.items(),
-            key=lambda kv: (len(kv[1]), _item_datetime(kv[1][0].item)),
-            reverse=True,
-        )
-        for _, group in ordered_groups:
-            if group:
-                return group[:max_scenes]
+        all_candidates.extend(window_candidates)
+        selections, coverage = _select_scenes_for_coverage(all_candidates, aoi_area, max_scenes)
+        if coverage > best_coverage:
+            best = selections
+            best_coverage = coverage
+        if coverage >= MOSAIC_COVERAGE_TARGET:
+            return selections
 
+    if best:
+        return best
     raise SceneNotFoundError(
         "No recent Sentinel-2 L2A scenes found for this AOI/date window."
     )
@@ -385,6 +581,7 @@ def build_mosaic_stack(
     utm_bounds = utm_bounds or project_bounds(aoi_bounds, epsg_code)
 
     stacks: list[xr.DataArray] = []
+    masks: list[da.Array] = []
 
     def _stack(selection: SceneSelection):
         return stackstac.stack(
@@ -412,16 +609,46 @@ def build_mosaic_stack(
         stack = stack.isel(time=0).transpose("band", "y", "x").astype("float32")
         if labels:
             stack = stack.assign_coords(band=list(labels))
-        stacks.append(stack)
+        mask = da.isfinite(stack.data).all(axis=0).astype("float32")
+        data = da.map_blocks(np.nan_to_num, stack.data, dtype=stack.data.dtype)
+        stacks.append(xr.DataArray(data, dims=stack.dims, coords=stack.coords, attrs=stack.attrs))
+        masks.append(mask)
 
     if not stacks:
         raise SceneValidationError(
             "Selected area does not intersect the Sentinel-2 scenes; try a different date or size."
         )
 
-    combined = xr.concat(stacks, dim="scene")
-    mosaic = da.nanmedian(combined.data, axis=0)
-    mosaic = mosaic.astype("float32")
+    data = da.stack([arr.data for arr in stacks], axis=0)  # scene, band, y, x
+    weight = da.stack(masks, axis=0)
+
+    if MOSAIC_NORMALIZE:
+        sample = data[:, :, ::8, ::8]
+        lo = da.nanpercentile(sample, 2.0, axis=(0, 2, 3), keepdims=True)
+        hi = da.nanpercentile(sample, 98.0, axis=(0, 2, 3), keepdims=True)
+        span = da.clip(hi - lo, 1e-6, None)
+        data = da.clip((data - lo) / span, 0, 1).astype("float32")
+
+    def _feather_mask(mask_arr: da.Array, radius: int = 6) -> da.Array:
+        size = max(1, int(radius))
+        return da.map_overlap(
+            lambda block: uniform_filter(block, size=size, mode="nearest"),
+            mask_arr.astype("float32"),
+            depth=size,
+            boundary="nearest",
+            dtype="float32",
+        )
+
+    feathered = _feather_mask(weight)
+    weighted_sum = (data * feathered[:, None, :, :]).sum(axis=0)
+    weight_sum = feathered.sum(axis=0)
+    mosaic = da.where(weight_sum > 1e-6, weighted_sum / weight_sum, np.nan).astype("float32")
+    combined = xr.DataArray(
+        data,
+        dims=("scene", "band", "y", "x"),
+        coords={"scene": np.arange(data.shape[0]), "band": stacks[0].coords["band"], "y": stacks[0].coords["y"], "x": stacks[0].coords["x"]},
+        attrs=stacks[0].attrs,
+    )
     return xr.DataArray(
         mosaic,
         dims=("band", "y", "x"),

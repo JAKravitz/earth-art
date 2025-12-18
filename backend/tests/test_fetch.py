@@ -17,10 +17,16 @@ class DummyAsset:
 
 
 class DummyItem:
-    def __init__(self, bands, scene_id: str = "dummy-scene", datatake: str = "2024-01-01T00:00:00Z"):
+    def __init__(
+        self,
+        bands,
+        scene_id: str = "dummy-scene",
+        datatake: str = "2024-01-01T00:00:00Z",
+        geometry: dict | None = None,
+    ):
         self.id = scene_id
         self.collection_id = "sentinel-2-l2a"
-        self.geometry = {
+        self.geometry = geometry or {
             "type": "Polygon",
             "coordinates": [[[-118, 32], [-118, 34], [-116, 34], [-116, 32], [-118, 32]]],
         }
@@ -183,3 +189,91 @@ def test_find_scenes_prioritizes_shared_datatake(monkeypatch):
 
     results = fetch.find_scenes_for_aoi(aoi_bounds=aoi, max_scenes=3)
     assert [selection.item.id for selection in results] == ["scene-a", "scene-b"]
+
+
+def test_find_scenes_falls_back_to_mixing_datatakes(monkeypatch):
+    aoi = (-117.5, 32.5, -116.5, 33.5)
+    # Each scene is a different datatake; we still want to mosaic across them
+    # instead of returning only the most recent single scene.
+    scene_a = DummyItem(["B04"], scene_id="scene-a", datatake="2024-01-03T10:00:00Z")
+    scene_b = DummyItem(["B04"], scene_id="scene-b", datatake="2024-01-02T10:00:00Z")
+    scene_c = DummyItem(["B04"], scene_id="scene-c", datatake="2024-01-01T10:00:00Z")
+
+    class DummySearch:
+        def __init__(self, items):
+            self._items = items
+
+        def items(self):
+            return self._items
+
+    class DummyClient:
+        def __init__(self, items):
+            self._items = items
+
+        def search(self, **kwargs):
+            return DummySearch(self._items)
+
+    monkeypatch.setattr(fetch.Client, "open", lambda *args, **kwargs: DummyClient([scene_a, scene_b, scene_c]))
+
+    results = fetch.find_scenes_for_aoi(aoi_bounds=aoi, max_scenes=3)
+    assert [selection.item.id for selection in results] == ["scene-a", "scene-b", "scene-c"]
+    assert len(results) <= fetch.MOSAIC_MAX_SCENES
+
+
+def test_find_scenes_accumulates_across_windows(monkeypatch):
+    aoi = (0.0, 0.0, 2.0, 1.0)
+
+    def make_geom(xmin: float, xmax: float):
+        return {"type": "Polygon", "coordinates": [[[xmin, 0.0], [xmin, 1.0], [xmax, 1.0], [xmax, 0.0], [xmin, 0.0]]]}
+
+    left = DummyItem(["B04"], scene_id="left", datatake="2024-01-03T10:00:00Z", geometry=make_geom(0.0, 1.0))
+    right = DummyItem(["B04"], scene_id="right", datatake="2023-12-30T10:00:00Z", geometry=make_geom(1.0, 2.0))
+
+    class DummySearch:
+        def __init__(self, items):
+            self._items = items
+
+        def items(self):
+            return self._items
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        def search(self, **kwargs):
+            self.calls += 1
+            return DummySearch([left] if self.calls == 1 else [right])
+
+    monkeypatch.setattr(fetch.Client, "open", lambda *args, **kwargs: DummyClient())
+
+    results = fetch.find_scenes_for_aoi(aoi_bounds=aoi, max_scenes=4)
+    assert sorted(sel.item.id for sel in results) == ["left", "right"]
+
+
+def test_find_scenes_stops_when_coverage_reached(monkeypatch):
+    aoi = (0.0, 0.0, 2.0, 1.0)
+
+    def make_geom(xmin: float, xmax: float):
+        return {"type": "Polygon", "coordinates": [[[xmin, 0.0], [xmin, 1.0], [xmax, 1.0], [xmax, 0.0], [xmin, 0.0]]]}
+
+    left = DummyItem(["B04"], scene_id="left", datatake="2024-01-03T10:00:00Z", geometry=make_geom(0.0, 1.0))
+    right = DummyItem(["B04"], scene_id="right", datatake="2024-01-02T10:00:00Z", geometry=make_geom(1.0, 2.0))
+    tiny_overlap = DummyItem(["B04"], scene_id="tiny", datatake="2024-01-01T10:00:00Z", geometry=make_geom(0.9, 1.1))
+
+    class DummySearch:
+        def __init__(self, items):
+            self._items = items
+
+        def items(self):
+            return self._items
+
+    class DummyClient:
+        def search(self, **kwargs):
+            return DummySearch([left, right, tiny_overlap])
+
+    monkeypatch.setattr(fetch.Client, "open", lambda *args, **kwargs: DummyClient())
+
+    results = fetch.find_scenes_for_aoi(aoi_bounds=aoi, max_scenes=4)
+    ids = [sel.item.id for sel in results]
+    assert "left" in ids and "right" in ids
+    assert "tiny" not in ids  # coverage target met without extra tiles

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import asyncio
+from pathlib import Path
 from typing import Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
@@ -29,6 +30,7 @@ PREVIEW_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(4, min(8, os.cpu_count() or 4)),
     thread_name_prefix="preview",
 )
+WATERMARK_PATH = Path(__file__).parent / "assets" / "planetory-logo.png"
 DEFAULT_GAMMA = {
     "true": 1.0,
     "truecolor": 1.0,
@@ -140,8 +142,9 @@ def export(request: ExportRequest) -> Response:
     target_px = max(request.target_size_px, PREVIEW_MAX_PX)
     image, selection = _run_pipeline(request, target_pixels=target_px)
     image = render.scale_to_max(image, request.target_size_px)
-    if request.watermark:
-        image = render.add_watermark(image, request.watermark)
+    watermark = render.load_watermark(WATERMARK_PATH)
+    if watermark or request.watermark:
+        image = render.add_watermark(image, watermark_image=watermark, text=request.watermark)
     raw, _ = render.encode_png(image)
     filename = f"earth-art-{selection.item.id}-{request.theme}.png"
     return Response(
@@ -244,6 +247,8 @@ def export_filter(request: ExportFilterRequest) -> Response:
             date_range=_date_range(request),
             aoi_bounds=tuple(request.aoi_bounds) if request.aoi_bounds else None,
         )
+        if hasattr(stack.data, "compute"):
+            stack = stack.copy(data=stack.data.compute())
     except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -259,8 +264,9 @@ def export_filter(request: ExportFilterRequest) -> Response:
             },
         )
     image = render.scale_to_max(image, request.target_size_px)
-    if request.watermark:
-        image = render.add_watermark(image, request.watermark)
+    watermark = render.load_watermark(WATERMARK_PATH)
+    if watermark or request.watermark:
+        image = render.add_watermark(image, watermark_image=watermark, text=request.watermark)
     raw, _ = render.encode_png(image)
     filename = f"earth-art-{request.filter.id}.png"
     return Response(

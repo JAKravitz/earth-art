@@ -73,3 +73,27 @@ curl -X POST http://localhost:8000/export \
   }' \
   --output geology.png
 ```
+
+## Quick start (one-time)
+
+- Install Python 3.11 (e.g., `brew install python@3.11`) and system libs: `brew install gdal geos proj`.
+- Backend env:
+  ```bash
+  cd backend
+  python3.11 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  ```
+  In VS Code, select the interpreter at `backend/.venv/bin/python` so terminals/debugging use the same env.
+- Frontend:
+  ```bash
+  cd ../frontend
+  npm install
+  cp ../.env.example .env.local   # set NEXT_PUBLIC_BACKEND_URL if different
+  ```
+
+## Daily/dev restart
+
+- Backend: `cd backend && source .venv/bin/activate && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`
+- Frontend (new terminal): `cd frontend && npm run dev`
+- Visit http://localhost:3000 (frontend) and http://localhost:8000/health (backend check).

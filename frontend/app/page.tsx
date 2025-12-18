@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import EarthsyLogo from "./components/EarthsyLogo";
 
 const heroImages = [
   "https://images.unsplash.com/photo-1469474968028-56623f02e42e?auto=format&fit=crop&w=1600&q=80",
@@ -25,10 +26,14 @@ export default function LandingPage() {
         <img src={fixedImage} alt="Earth art hero" />
       </div>
       <div className="hero-copy">
-        <h1 className="title">Earthsy</h1>
+        <h1 className="title">
+          <EarthsyLogo variant="wordmark" priority className="hero-logo" />
+          <span className="sr-only">Earthsy</span>
+        </h1>
         <p className="lede">
-          Earthsy turns real satellite and geospatial data into custom artwork. Explore landscapes, rivers, and cities and
-          transform them into unique prints.
+          <EarthsyLogo variant="icon" className="inline-logo" />
+          <span className="sr-only">Earthsy</span> turns real satellite and geospatial data into custom artwork. Explore
+          landscapes, rivers, and cities and transform them into unique prints.
         </p>
         <div className="cta-group">
           <Link className="primary btn" href="/products">
@@ -44,7 +49,7 @@ export default function LandingPage() {
         .landing {
           display: grid;
           grid-template-columns: 1.2fr 1fr;
-          height: calc(100vh - 72px);
+          height: calc(100vh - 64px);
           padding: 32px 28px;
           gap: 24px;
           background: radial-gradient(circle at 20% 20%, rgba(37, 99, 235, 0.1), transparent 35%),
@@ -75,11 +80,27 @@ export default function LandingPage() {
         }
         .title {
           margin: 0;
-          font-size: clamp(2.8rem, 4vw, 4rem);
+          display: inline-flex;
+          align-items: center;
+          gap: 10px;
+        }
+        .hero-logo {
+          height: 96px;
+          width: auto;
+          max-width: 100%;
+          object-fit: contain;
         }
         .lede {
           color: #cbd5f5;
           line-height: 1.6;
+          display: flex;
+          gap: 10px;
+          align-items: center;
+        }
+        .inline-logo {
+          height: 32px;
+          width: auto;
+          object-fit: contain;
         }
         .cta-group {
           display: flex;
@@ -121,6 +142,11 @@ export default function LandingPage() {
         .hint {
           color: #94a3b8;
           margin-top: 4px;
+        }
+        @media (min-width: 768px) {
+          .hero-logo {
+            height: 128px;
+          }
         }
         @media (max-width: 960px) {
           .landing {

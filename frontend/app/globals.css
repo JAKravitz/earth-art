@@ -26,18 +26,43 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 24px;
+  padding: 12px 20px;
+  min-height: 60px;
   background: rgba(10, 14, 25, 0.9);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .brand {
-  font-weight: 700;
-  font-size: 1.2rem;
+  display: flex;
+  align-items: center;
   color: #e5e7eb;
   text-decoration: none;
   cursor: pointer;
+}
+
+.earthsy-logo-wordmark,
+.earthsy-logo-icon {
+  display: inline-block;
+  height: auto;
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  vertical-align: middle;
+  line-height: 1;
+}
+
+.earthsy-logo-wordmark {
+  max-height: 132px;
+}
+
+.earthsy-logo-icon {
+  max-height: 48px;
+}
+
+.brand-mark {
+  height: 40px;
+  width: auto;
 }
 
 .nav-links {
@@ -56,6 +81,17 @@ button {
   color: #fff;
 }
 
+.sr-only {
+  border: 0;
+  clip: rect(0 0 0 0);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  width: 1px;
+}
+
 .app-shell {
-  padding: 72px 0 0 0;
+  padding: 64px 0 0 0;
 }

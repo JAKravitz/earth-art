@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import EarthsyLogo from "../components/EarthsyLogo";
 
 const cards = [
   {
@@ -33,7 +34,11 @@ export default function ProductsPage() {
   return (
     <div className="products">
       <h1>Choose your world</h1>
-      <p className="lede">Pick a domain to begin crafting Earthsy artwork.</p>
+      <p className="lede">
+        Pick a domain to begin crafting
+        <EarthsyLogo variant="icon" className="inline-logo" />
+        <span className="sr-only">Earthsy</span> artwork.
+      </p>
       <div className="grid">
         {cards.map((card) => (
           <Link key={card.id} href={card.href} className="card">
@@ -56,6 +61,14 @@ export default function ProductsPage() {
         .lede {
           color: #94a3b8;
           margin-top: 4px;
+          display: flex;
+          gap: 8px;
+          align-items: center;
+        }
+        .inline-logo {
+          height: 26px;
+          width: auto;
+          object-fit: contain;
         }
         .grid {
           display: grid;

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import numpy as np
 import xarray as xr
-from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageEnhance
+from functools import lru_cache
+from pathlib import Path
+from PIL import Image, ImageColor, ImageDraw, ImageEnhance, ImageFont
 
 
 def make_solid_canvas(height: int, width: int, hex_color: str | None) -> np.ndarray:
@@ -120,20 +122,80 @@ def scale_to_max(image: Image.Image, max_side: int) -> Image.Image:
     return image.resize(new_size, Image.LANCZOS)
 
 
-def add_watermark(image: Image.Image, text: str) -> Image.Image:
+def _add_text_watermark(image: Image.Image, text: str) -> Image.Image:
     if not text:
         return image
     drawable = ImageDraw.Draw(image)
     font = ImageFont.load_default()
-    margin = 8
-    text_width, text_height = drawable.textsize(text, font=font)
+    margin = 12
+    text_bbox = drawable.textbbox((0, 0), text, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
     x = image.width - text_width - margin
     y = image.height - text_height - margin
     drawable.rectangle(
-        [(x - 4, y - 2), (x + text_width + 4, y + text_height + 2)],
+        [(x - 6, y - 4), (x + text_width + 6, y + text_height + 4)],
         fill=(0, 0, 0, 120),
     )
     drawable.text((x, y), text, font=font, fill=(255, 255, 255, 200))
+    return image
+
+
+def _apply_opacity(layer: Image.Image, opacity: float) -> Image.Image:
+    opacity = max(0.0, min(opacity, 1.0))
+    rgba = layer.convert("RGBA")
+    alpha = rgba.getchannel("A").point(lambda p: int(p * opacity))
+    rgba.putalpha(alpha)
+    return rgba
+
+
+@lru_cache()
+def load_watermark(path: str | Path) -> Image.Image | None:
+    file_path = Path(path)
+    if not file_path.exists():
+        return None
+    try:
+        with Image.open(file_path) as img:
+            return img.convert("RGBA")
+    except Exception:
+        return None
+
+
+def add_image_watermark(
+    image: Image.Image,
+    watermark: Image.Image,
+    *,
+    opacity: float = 0.65,
+    max_width_ratio: float = 0.2,
+    margin: int = 18,
+) -> Image.Image:
+    if watermark.mode != "RGBA":
+        watermark = watermark.convert("RGBA")
+    if max_width_ratio <= 0:
+        max_width_ratio = 0.2
+    target_width = int(image.width * max_width_ratio)
+    scale = min(1.0, target_width / watermark.width)
+    new_size = (max(1, int(watermark.width * scale)), max(1, int(watermark.height * scale)))
+    scaled = watermark.resize(new_size, Image.LANCZOS)
+    faded = _apply_opacity(scaled, opacity)
+
+    base = image.convert("RGBA")
+    x = base.width - faded.width - margin
+    y = base.height - faded.height - margin
+    base.alpha_composite(faded, dest=(x, y))
+    return base.convert("RGB")
+
+
+def add_watermark(
+    image: Image.Image,
+    *,
+    watermark_image: Image.Image | None = None,
+    text: str | None = None,
+) -> Image.Image:
+    if watermark_image:
+        return add_image_watermark(image, watermark_image)
+    if text:
+        return _add_text_watermark(image, text)
     return image
 
 
