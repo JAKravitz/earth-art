@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Sequence, Tuple, Optional
@@ -17,7 +18,7 @@ from rasterio.enums import Resampling
 from shapely.geometry import Polygon, box, shape
 from shapely.ops import transform as shapely_transform, unary_union
 import stackstac
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 import xarray as xr
 
 DEFAULT_STAC_API = os.getenv("STAC_API_URL", "https://earth-search.aws.element84.com/v1")
@@ -25,12 +26,27 @@ MOSAIC_MAX_SCENES = max(1, int(os.getenv("MOSAIC_MAX_SCENES", "6")))
 MOSAIC_COVERAGE_TARGET = float(os.getenv("MOSAIC_COVERAGE_TARGET", "0.98"))
 MOSAIC_MIN_EXTRA_COVERAGE = float(os.getenv("MOSAIC_MIN_EXTRA_COVERAGE", "0.15"))
 MOSAIC_NORMALIZE = os.getenv("MOSAIC_NORMALIZE", "true").lower() not in ("0", "false", "no")
+# Feather radius (in pixels) used for seam blending when mosaicking scenes
+MOSAIC_FEATHER_RADIUS = int(os.getenv("MOSAIC_FEATHER_RADIUS", "96"))
+MOSAIC_WEIGHT_MODE = os.getenv("MOSAIC_WEIGHT_MODE", "distance").lower()
+MOSAIC_WEIGHT_SMOOTHSTEP = os.getenv("MOSAIC_WEIGHT_SMOOTHSTEP", "true").lower() not in ("0", "false", "no")
+MOSAIC_WEIGHT_DOWNSAMPLE = max(1, int(os.getenv("MOSAIC_WEIGHT_DOWNSAMPLE", "4")))
+MOSAIC_HARMONIZE = os.getenv("MOSAIC_HARMONIZE", "true").lower() not in ("0", "false", "no")
+MOSAIC_HARMONIZE_PLOW = float(os.getenv("MOSAIC_HARMONIZE_PLOW", "10"))
+MOSAIC_HARMONIZE_PHIGH = float(os.getenv("MOSAIC_HARMONIZE_PHIGH", "90"))
+MOSAIC_HARMONIZE_STRIDE = max(1, int(os.getenv("MOSAIC_HARMONIZE_STRIDE", "6")))
+MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS = int(os.getenv("MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS", "4000"))
+MOSAIC_HARMONIZE_GAIN_MIN = float(os.getenv("MOSAIC_HARMONIZE_GAIN_MIN", "0.6"))
+MOSAIC_HARMONIZE_GAIN_MAX = float(os.getenv("MOSAIC_HARMONIZE_GAIN_MAX", "1.7"))
+MOSAIC_HARMONIZE_CLAMP_MIN = float(os.getenv("MOSAIC_HARMONIZE_CLAMP_MIN", "0.0"))
+MOSAIC_HARMONIZE_CLAMP_MAX = float(os.getenv("MOSAIC_HARMONIZE_CLAMP_MAX", "1.5"))
+MOSAIC_HARMONIZE_BRIGHT_CLIP_PCT = float(os.getenv("MOSAIC_HARMONIZE_BRIGHT_CLIP_PCT", "98"))
 GEOD = Geod(ellps="WGS84")
 WGS84 = "EPSG:4326"
 EQUAL_AREA_CRS = "EPSG:6933"
 # Prefer a global equal-area transform for coverage calcs to avoid lat/long distortion.
 EQUAL_AREA_TRANSFORMER = Transformer.from_crs(WGS84, EQUAL_AREA_CRS, always_xy=True)
-# Prefer clearer scenes: tightened cloud limits over both windows
+# Search windows (days, cloud limit used for single-scene lookups); mosaics score cloud later.
 SEARCH_WINDOWS = ((90, 5), (365, 20))
 LOGGER = logging.getLogger(__name__)
 ALIAS_COMMON_NAME = {
@@ -41,6 +57,29 @@ ALIAS_COMMON_NAME = {
     "B11": ["swir16"],
     "B12": ["swir22"],
 }
+
+
+def _has_aws_credentials() -> bool:
+    if os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"):
+        return True
+    if os.getenv("AWS_PROFILE"):
+        return True
+    credentials_path = os.path.expanduser(os.getenv("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials"))
+    if os.path.exists(credentials_path) and os.path.getsize(credentials_path) > 0:
+        return True
+    config_path = os.path.expanduser(os.getenv("AWS_CONFIG_FILE", "~/.aws/config"))
+    if os.path.exists(config_path) and os.path.getsize(config_path) > 0:
+        return True
+    return False
+
+
+def _ensure_aws_no_sign() -> None:
+    if os.getenv("AWS_NO_SIGN_REQUEST"):
+        return
+    if _has_aws_credentials():
+        return
+    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+    LOGGER.info("AWS_NO_SIGN_REQUEST=YES (no AWS credentials detected)")
 
 
 class SceneSearchError(Exception):
@@ -140,6 +179,26 @@ def _datatake_key(item: Item) -> str:
     return props.get("datetime", item.id)
 
 
+def _datatake_group_key(item: Item) -> str:
+    props = item.properties or {}
+    datatake = props.get("sentinel:datatake_start_time") or props.get(
+        "s2:datatake_start_time"
+    )
+    if datatake:
+        return str(datatake)
+    if item.datetime:
+        return item.datetime.date().isoformat()
+    raw = props.get("datetime")
+    if isinstance(raw, datetime):
+        return raw.date().isoformat()
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+        except ValueError:
+            return raw
+    return item.id
+
+
 def _item_datetime(item: Item) -> datetime:
     props = item.properties or {}
     raw = props.get("datetime")
@@ -165,6 +224,13 @@ def _resolve_assets(item: Item, requested: Sequence[str], prefer_gsd: int = 10) 
             for band in eo_bands:
                 if "common_name" in band:
                     common_names.append(band["common_name"])
+        raster_bands = info.get("raster:bands")
+        if isinstance(raster_bands, list) and raster_bands:
+            band_count = len(raster_bands)
+        elif isinstance(eo_bands, list) and eo_bands:
+            band_count = len(eo_bands)
+        else:
+            band_count = 1
         gsd = info.get("gsd") or info.get("proj:gsd") or asset.extra_fields.get("proj:resolution")
         available.append(
             {
@@ -173,6 +239,7 @@ def _resolve_assets(item: Item, requested: Sequence[str], prefer_gsd: int = 10) 
                 "prefix": key.upper().split("_")[0],
                 "common_names": [name.lower() for name in common_names],
                 "gsd": gsd,
+                "band_count": band_count,
             }
         )
 
@@ -191,6 +258,9 @@ def _resolve_assets(item: Item, requested: Sequence[str], prefer_gsd: int = 10) 
                 for asset in available
                 if any(name in asset["common_names"] for name in cn)
             ]
+        single_band = [asset for asset in candidates if asset["band_count"] == 1]
+        if single_band:
+            candidates = single_band
         if not candidates:
             missing.append(band)
             continue
@@ -254,11 +324,27 @@ def _group_coverage(selections: List[SceneSelection], aoi_area: float) -> Tuple[
     return _coverage_fraction(unioned, aoi_area), unioned
 
 
+def _mean_cloud_cover(selections: Sequence[SceneSelection]) -> Optional[float]:
+    values = []
+    for sel in selections:
+        props = sel.item.properties or {}
+        raw = props.get("eo:cloud_cover")
+        if raw is None:
+            continue
+        try:
+            values.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
 def _normalize_stack(data: da.Array, p_low: float = 2.0, p_high: float = 98.0) -> da.Array:
-    sample = data[:, ::8, ::8]
-    lo = da.nanpercentile(sample, p_low, axis=(1, 2), keepdims=True)
-    hi = da.nanpercentile(sample, p_high, axis=(1, 2), keepdims=True)
-    span = da.clip(hi - lo, 1e-6, None)
+    sample_np = data[:, ::8, ::8].compute()
+    lo = np.nanpercentile(sample_np, p_low, axis=(1, 2), keepdims=True)
+    hi = np.nanpercentile(sample_np, p_high, axis=(1, 2), keepdims=True)
+    span = np.clip(hi - lo, 1e-6, None)
     return da.clip((data - lo) / span, 0, 1).astype("float32")
 
 
@@ -272,7 +358,7 @@ def _select_scenes_for_coverage(
 
     groups: dict[str, List[SceneSelection]] = {}
     for sel in selections:
-        key = _datatake_key(sel.item)
+        key = _datatake_group_key(sel.item)
         groups.setdefault(key, []).append(sel)
 
     group_summaries = []
@@ -286,25 +372,38 @@ def _select_scenes_for_coverage(
                 "coverage": coverage,
                 "union": union_geom,
                 "items": sorted_group,
-                "datetime": _item_datetime(group[0].item),
+                "datetime": max((_item_datetime(sel.item) for sel in group), default=datetime.min),
+                "mean_cloud": _mean_cloud_cover(group),
             }
         )
 
-    group_summaries.sort(key=lambda g: (g["coverage"], len(g["items"]), g["datetime"]), reverse=True)
+    group_summaries.sort(key=lambda g: g["coverage"], reverse=True)
     limit = min(max_scenes, MOSAIC_MAX_SCENES)
+    top_groups = []
+    for summary in group_summaries[:3]:
+        mean_cloud = summary["mean_cloud"]
+        cloud_str = f"{mean_cloud:.1f}" if mean_cloud is not None else "n/a"
+        top_groups.append(
+            f"{summary['key']} coverage={summary['coverage']:.3f} mean_cloud={cloud_str} "
+            f"datetime={summary['datetime'].isoformat()} items={len(summary['items'])}"
+        )
+    LOGGER.info("Top datatake groups: %s", top_groups)
 
-    # If every datatake only has a single scene, mix across datatakes up to the cap
-    # to mimic the prior behavior and avoid over-relying on one sliver.
-    if len(group_summaries) > 1 and max(len(g["items"]) for g in group_summaries) == 1:
+    def _datetime_sort_value(value: datetime) -> float:
+        try:
+            return value.timestamp()
+        except (OSError, OverflowError, ValueError):
+            return 0.0
+
+    def _cloud_sort_value(value: Optional[float]) -> float:
+        return value if value is not None else float("inf")
+
+    def _select_group_scenes(group_items: List[SceneSelection]) -> Tuple[List[SceneSelection], float]:
         selected: list[SceneSelection] = []
         covered = None
-        for summary in group_summaries:
+        for sel in group_items:
             if len(selected) >= limit:
                 break
-            sel = summary["items"][0]
-            if covered is not None and _coverage_fraction(covered, aoi_area) >= MOSAIC_COVERAGE_TARGET:
-                if sel.coverage is not None and sel.coverage < MOSAIC_MIN_EXTRA_COVERAGE:
-                    continue
             selected.append(sel)
             geom = sel.coverage_geom
             if geom is None:
@@ -316,61 +415,87 @@ def _select_scenes_for_coverage(
                     covered = covered.union(geom)
                 except Exception:
                     covered = unary_union([covered, geom])
-        coverage = _coverage_fraction(covered, aoi_area)
+            coverage = _coverage_fraction(covered, aoi_area)
+            if coverage >= MOSAIC_COVERAGE_TARGET:
+                break
+        return selected, _coverage_fraction(covered, aoi_area)
+
+    def _select_multi_datatake(group_list: List[dict], anchor: dict) -> Tuple[List[SceneSelection], float]:
+        anchor_ts = _datetime_sort_value(anchor["datetime"])
+        ordered_groups = sorted(
+            group_list,
+            key=lambda g: abs(_datetime_sort_value(g["datetime"]) - anchor_ts),
+        )
+        selected: list[SceneSelection] = []
+        covered = None
+        coverage = 0.0
+        for summary in ordered_groups:
+            for sel in summary["items"]:
+                if len(selected) >= limit:
+                    break
+                geom = sel.coverage_geom
+                if geom is None:
+                    selected.append(sel)
+                    continue
+                if covered is not None:
+                    if coverage >= MOSAIC_COVERAGE_TARGET:
+                        if sel.coverage is not None and sel.coverage < MOSAIC_MIN_EXTRA_COVERAGE:
+                            continue
+                    try:
+                        incremental = geom.difference(covered)
+                    except Exception:
+                        incremental = geom
+                    if incremental.is_empty or _coverage_fraction(incremental, aoi_area) < 0.005:
+                        continue
+                    try:
+                        covered = covered.union(geom)
+                    except Exception:
+                        covered = unary_union([covered, geom])
+                else:
+                    covered = geom
+                selected.append(sel)
+                coverage = _coverage_fraction(covered, aoi_area)
+                if coverage >= MOSAIC_COVERAGE_TARGET:
+                    break
+            if coverage >= MOSAIC_COVERAGE_TARGET or len(selected) >= limit:
+                break
+        return selected, _coverage_fraction(covered, aoi_area)
+
+    coverage_tolerance = 0.02
+    eligible = [g for g in group_summaries if g["coverage"] >= MOSAIC_COVERAGE_TARGET]
+    candidate_groups = eligible or group_summaries
+    top_coverage = candidate_groups[0]["coverage"]
+    coverage_candidates = [
+        g for g in candidate_groups if top_coverage - g["coverage"] <= coverage_tolerance
+    ]
+    coverage_candidates.sort(
+        key=lambda g: (_cloud_sort_value(g["mean_cloud"]), -_datetime_sort_value(g["datetime"]))
+    )
+    best = coverage_candidates[0]
+    selected, coverage = _select_group_scenes(best["items"])
+
+    if eligible:
+        LOGGER.info(
+            "Mosaic datatake selection: key=%s mode=single coverage=%.3f",
+            best["key"],
+            coverage,
+        )
         return selected, coverage
 
-    best = group_summaries[0]
-    selected: list[SceneSelection] = []
-    covered = None
-    for sel in best["items"]:
-        if len(selected) >= limit:
-            break
-        selected.append(sel)
-        geom = sel.coverage_geom
-        if geom is None:
-            continue
-        if covered is None:
-            covered = geom
-        else:
-            try:
-                covered = covered.union(geom)
-            except Exception:
-                covered = unary_union([covered, geom])
-    coverage = _coverage_fraction(covered, aoi_area)
-    if coverage >= MOSAIC_COVERAGE_TARGET or len(group_summaries) == 1 or len(selected) >= limit:
-        return selected, coverage
-
-    extras: list[SceneSelection] = []
-    for summary in group_summaries[1:]:
-        extras.extend(summary["items"])
-    extras.sort(key=lambda s: (s.coverage or 0.0, _item_datetime(s.item)), reverse=True)
-
-    for sel in extras:
-        if len(selected) >= limit:
-            break
-        geom = sel.coverage_geom
-        if geom is None:
-            selected.append(sel)
-            continue
-        if covered is not None:
-            try:
-                incremental = geom.difference(covered)
-            except Exception:
-                incremental = geom
-            if incremental.is_empty or _coverage_fraction(incremental, aoi_area) < 0.005:
-                continue
-            try:
-                covered = covered.union(geom)
-            except Exception:
-                covered = unary_union([covered, geom])
-        else:
-            covered = geom
-        selected.append(sel)
-        coverage = _coverage_fraction(covered, aoi_area)
-        if coverage >= MOSAIC_COVERAGE_TARGET:
-            break
-
-    coverage = _coverage_fraction(covered, aoi_area)
+    if MOSAIC_HARMONIZE:
+        LOGGER.warning(
+            "No single datatake covers AOI; falling back to multi-datatake mosaic; seams may occur; harmonization enabled."
+        )
+    else:
+        LOGGER.warning(
+            "No single datatake covers AOI; falling back to multi-datatake mosaic; seams may occur; harmonization disabled."
+        )
+    selected, coverage = _select_multi_datatake(group_summaries, best)
+    LOGGER.info(
+        "Mosaic datatake selection: mode=fallback-multi base_key=%s coverage=%.3f",
+        best["key"],
+        coverage,
+    )
     return selected, coverage
 
 
@@ -427,6 +552,7 @@ def find_scenes_for_aoi(
     best: list[SceneSelection] = []
     best_coverage = 0.0
     seen_ids: set[str] = set()
+    candidate_limit = max(max_scenes * 2, 200)
 
     try:
         client = Client.open(stac_api)
@@ -438,15 +564,25 @@ def find_scenes_for_aoi(
         LOGGER.warning(msg)
         raise SceneSearchError(msg) from exc
 
-    for days, cloud in SEARCH_WINDOWS:
+    for days, _cloud in SEARCH_WINDOWS:
         datetime_filter = date_range or _default_datetime(days)
         search = client.search(
             collections=[collection],
             bbox=aoi_bounds,
-            limit=max_scenes * 2,
+            limit=candidate_limit,
             sortby=[{"field": "properties.datetime", "direction": "desc"}],
-            query={"eo:cloud_cover": {"lt": cloud}},
             datetime=datetime_filter,
+            fields={
+                "include": [
+                    "id",
+                    "geometry",
+                    "assets",
+                    "properties",
+                    "properties.eo:cloud_cover",
+                    "properties.sentinel:datatake_start_time",
+                    "properties.s2:datatake_start_time",
+                ]
+            },
         )
         window_candidates: list[SceneSelection] = []
         for item in search.items():
@@ -464,7 +600,7 @@ def find_scenes_for_aoi(
             )
             window_candidates.append(selection)
             seen_ids.add(item.id)
-            if len(window_candidates) + len(all_candidates) >= max_scenes * 2:
+            if len(window_candidates) + len(all_candidates) >= candidate_limit:
                 break
 
         if not window_candidates and not all_candidates:
@@ -509,6 +645,7 @@ def load_scene_stack(
     labels: Sequence[str],
     resampling: Resampling,
 ) -> Tuple[xr.DataArray, int]:
+    _ensure_aws_no_sign()
     center_lat = (bbox4326[1] + bbox4326[3]) / 2
     center_lon = (bbox4326[0] + bbox4326[2]) / 2
     epsg_code = determine_utm_epsg(center_lat, center_lon)
@@ -579,9 +716,14 @@ def build_mosaic_stack(
     center_lon = (aoi_bounds[0] + aoi_bounds[2]) / 2
     epsg_code = epsg_code or determine_utm_epsg(center_lat, center_lon)
     utm_bounds = utm_bounds or project_bounds(aoi_bounds, epsg_code)
+    _ensure_aws_no_sign()
 
     stacks: list[xr.DataArray] = []
     masks: list[da.Array] = []
+    raw_stacks: list[xr.DataArray] = []
+    selection_log = []
+    scale_logged = False
+    stack_start = time.perf_counter()
 
     def _stack(selection: SceneSelection):
         return stackstac.stack(
@@ -609,40 +751,183 @@ def build_mosaic_stack(
         stack = stack.isel(time=0).transpose("band", "y", "x").astype("float32")
         if labels:
             stack = stack.assign_coords(band=list(labels))
+        scales = []
+        for asset_id in bands:
+            asset = selection.item.assets.get(asset_id)
+            raster_meta = (asset.extra_fields or {}).get("raster:bands", [{}]) if asset else [{}]
+            scales.append(raster_meta[0].get("scale", 1))
+        scale_arr = np.array(scales, dtype="float32")[:, None, None]
+        if not scale_logged:
+            band_names = list(labels) if labels else list(bands)
+            LOGGER.info(
+                "Mosaic band scales: %s",
+                {name: float(scale) for name, scale in zip(band_names, scales)},
+            )
+            scale_logged = True
+        stack = (stack * scale_arr).astype("float32")
+        # Preserve raw (with NaNs) for statistics; construct mask on raw validity
+        raw_stacks.append(stack)
         mask = da.isfinite(stack.data).all(axis=0).astype("float32")
-        data = da.map_blocks(np.nan_to_num, stack.data, dtype=stack.data.dtype)
-        stacks.append(xr.DataArray(data, dims=stack.dims, coords=stack.coords, attrs=stack.attrs))
+        # Defer nan_to_num until after exposure matching to avoid biasing stats
+        stacks.append(xr.DataArray(stack.data, dims=stack.dims, coords=stack.coords, attrs=stack.attrs))
         masks.append(mask)
+        selection_log.append(
+            {
+                "id": selection.item.id,
+                "datatake": _datatake_key(selection.item),
+                "coverage": selection.coverage,
+            }
+        )
 
     if not stacks:
         raise SceneValidationError(
             "Selected area does not intersect the Sentinel-2 scenes; try a different date or size."
         )
 
+    stack_elapsed = time.perf_counter() - stack_start
+    LOGGER.info("Mosaic stacking completed in %.3fs for %d scenes", stack_elapsed, len(stacks))
+    LOGGER.info(
+        "Mosaic selections: %s",
+        [
+            f"{item['id']} datatake={item['datatake']} coverage={item['coverage']:.3f}"
+            if item["coverage"] is not None
+            else f"{item['id']} datatake={item['datatake']} coverage=None"
+            for item in selection_log
+        ],
+    )
+
+    def _compute_weight_mask(valid_mask: da.Array) -> da.Array:
+        radius = max(1, MOSAIC_FEATHER_RADIUS)
+        downsample = MOSAIC_WEIGHT_DOWNSAMPLE
+        mask_np = valid_mask.astype(bool)[::downsample, ::downsample].compute()
+        if mask_np.size == 0:
+            return da.zeros(valid_mask.shape, dtype="float32")
+        radius_small = max(1.0, radius / float(downsample))
+        if MOSAIC_WEIGHT_MODE == "gaussian":
+            sigma = max(1.0, radius_small / 3.0)
+            w = gaussian_filter(mask_np.astype("float32"), sigma=sigma, mode="nearest")
+            max_w = float(np.nanmax(w)) if np.isfinite(w).any() else 1.0
+            w = np.clip(w / max(max_w, 1e-6), 0.0, 1.0)
+            w = np.where(mask_np, w, 0.0).astype("float32")
+        else:
+            dist = distance_transform_edt(mask_np)
+            w = np.clip(dist / float(radius_small), 0.0, 1.0)
+            if MOSAIC_WEIGHT_SMOOTHSTEP:
+                w = w * w * (3.0 - 2.0 * w)
+            w = np.where(mask_np, w, 0.0).astype("float32")
+        if downsample > 1:
+            w = np.repeat(np.repeat(w, downsample, axis=0), downsample, axis=1)
+            w = w[: valid_mask.shape[0], : valid_mask.shape[1]]
+        chunks = getattr(valid_mask, "chunks", None) or valid_mask.shape
+        return da.from_array(w, chunks=chunks)
+
+    if MOSAIC_HARMONIZE and len(stacks) > 1:
+        harmonize_start = time.perf_counter()
+        LOGGER.info(
+            "Mosaic harmonization enabled plow=%.1f phigh=%.1f stride=%d min_overlap=%d gain_clip=[%.3f, %.3f] clamp=[%.2f, %.2f] bright_clip_pct=%.1f",
+            MOSAIC_HARMONIZE_PLOW,
+            MOSAIC_HARMONIZE_PHIGH,
+            MOSAIC_HARMONIZE_STRIDE,
+            MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS,
+            MOSAIC_HARMONIZE_GAIN_MIN,
+            MOSAIC_HARMONIZE_GAIN_MAX,
+            MOSAIC_HARMONIZE_CLAMP_MIN,
+            MOSAIC_HARMONIZE_CLAMP_MAX,
+            MOSAIC_HARMONIZE_BRIGHT_CLIP_PCT,
+        )
+        ref_data = raw_stacks[0].data
+        for idx in range(1, len(stacks)):
+            scene_id = selection_log[idx]["id"]
+            scene_data = raw_stacks[idx].data
+            stride = MOSAIC_HARMONIZE_STRIDE
+            sample_ref = ref_data[:, ::stride, ::stride]
+            sample_scene = scene_data[:, ::stride, ::stride]
+            valid_ref = da.isfinite(sample_ref).all(axis=0) & da.all(sample_ref > 0, axis=0)
+            valid_scene = da.isfinite(sample_scene).all(axis=0) & da.all(sample_scene > 0, axis=0)
+            overlap_mask = valid_ref & valid_scene
+            ref_np, scene_np, mask_np = da.compute(sample_ref, sample_scene, overlap_mask)
+            mask_np = np.asarray(mask_np, dtype=bool)
+            overlap_pixels = int(mask_np.sum())
+            if overlap_pixels < MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS:
+                LOGGER.info(
+                    "Mosaic harmonize scene=%s skipped (overlap=%d < min=%d)",
+                    scene_id,
+                    overlap_pixels,
+                    MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS,
+                )
+                continue
+            bright_clip_pct = MOSAIC_HARMONIZE_BRIGHT_CLIP_PCT
+            if bright_clip_pct and ref_np.shape[0] >= 3:
+                brightness = np.nanmean(np.where(mask_np, ref_np[:3], np.nan), axis=0)
+                if np.isfinite(brightness).any():
+                    bright_thresh = np.nanpercentile(brightness, bright_clip_pct)
+                    if np.isfinite(bright_thresh):
+                        bright_mask = brightness <= bright_thresh
+                        mask_np = mask_np & bright_mask
+                        overlap_pixels = int(mask_np.sum())
+                        if overlap_pixels < MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS:
+                            LOGGER.info(
+                                "Mosaic harmonize scene=%s skipped after bright clip (overlap=%d < min=%d)",
+                                scene_id,
+                                overlap_pixels,
+                                MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS,
+                            )
+                            continue
+            masked_ref = np.where(mask_np, ref_np, np.nan)
+            masked_scene = np.where(mask_np, scene_np, np.nan)
+            ref_percentiles = np.nanpercentile(
+                masked_ref, [MOSAIC_HARMONIZE_PLOW, MOSAIC_HARMONIZE_PHIGH], axis=(1, 2)
+            )
+            scene_percentiles = np.nanpercentile(
+                masked_scene, [MOSAIC_HARMONIZE_PLOW, MOSAIC_HARMONIZE_PHIGH], axis=(1, 2)
+            )
+            ref_lo, ref_hi = ref_percentiles
+            scene_lo, scene_hi = scene_percentiles
+            span_scene = np.clip(scene_hi - scene_lo, 1e-6, None)
+            gain = (ref_hi - ref_lo) / span_scene
+            offset = ref_lo - gain * scene_lo
+            gain = np.clip(np.where(np.isfinite(gain), gain, 1.0), MOSAIC_HARMONIZE_GAIN_MIN, MOSAIC_HARMONIZE_GAIN_MAX)
+            offset = np.where(np.isfinite(offset), offset, 0.0)
+            LOGGER.info(
+                "Mosaic harmonize scene=%s overlap=%d gains=%s offsets=%s",
+                scene_id,
+                overlap_pixels,
+                np.round(gain, 4).tolist(),
+                np.round(offset, 4).tolist(),
+            )
+            corrected = stacks[idx] * gain[:, None, None] + offset[:, None, None]
+            corrected = corrected.clip(MOSAIC_HARMONIZE_CLAMP_MIN, MOSAIC_HARMONIZE_CLAMP_MAX)
+            stacks[idx] = corrected
+            raw_stacks[idx] = corrected
+        LOGGER.info("Mosaic harmonization completed in %.3fs", time.perf_counter() - harmonize_start)
+    elif not MOSAIC_HARMONIZE:
+        LOGGER.info("Mosaic harmonization disabled by config")
+
+    weight_start = time.perf_counter()
+    weights = [_compute_weight_mask(mask) for mask in masks]
+    weight = da.stack(weights, axis=0)
     data = da.stack([arr.data for arr in stacks], axis=0)  # scene, band, y, x
-    weight = da.stack(masks, axis=0)
+    LOGGER.info("Mosaic weight mask generation completed in %.3fs", time.perf_counter() - weight_start)
+
+    LOGGER.info(
+        "Mosaic weight mode=%s radius=%d smoothstep=%s downsample=%d",
+        MOSAIC_WEIGHT_MODE,
+        MOSAIC_FEATHER_RADIUS,
+        MOSAIC_WEIGHT_SMOOTHSTEP,
+        MOSAIC_WEIGHT_DOWNSAMPLE,
+    )
+    blend_start = time.perf_counter()
+    weighted_sum = da.nansum(data * weight[:, None, :, :], axis=0)
+    weight_sum = weight.sum(axis=0)
+    mosaic = da.where(weight_sum > 1e-6, weighted_sum / weight_sum, np.nan).astype("float32")
+    LOGGER.info("Mosaic blend graph assembled in %.3fs", time.perf_counter() - blend_start)
 
     if MOSAIC_NORMALIZE:
-        sample = data[:, :, ::8, ::8]
-        lo = da.nanpercentile(sample, 2.0, axis=(0, 2, 3), keepdims=True)
-        hi = da.nanpercentile(sample, 98.0, axis=(0, 2, 3), keepdims=True)
-        span = da.clip(hi - lo, 1e-6, None)
-        data = da.clip((data - lo) / span, 0, 1).astype("float32")
+        # Normalize once on the final mosaic to avoid seam artifacts from per-scene adjustments.
+        normalize_start = time.perf_counter()
+        mosaic = _normalize_stack(mosaic)
+        LOGGER.info("Mosaic normalization completed in %.3fs", time.perf_counter() - normalize_start)
 
-    def _feather_mask(mask_arr: da.Array, radius: int = 6) -> da.Array:
-        size = max(1, int(radius))
-        return da.map_overlap(
-            lambda block: uniform_filter(block, size=size, mode="nearest"),
-            mask_arr.astype("float32"),
-            depth=size,
-            boundary="nearest",
-            dtype="float32",
-        )
-
-    feathered = _feather_mask(weight)
-    weighted_sum = (data * feathered[:, None, :, :]).sum(axis=0)
-    weight_sum = feathered.sum(axis=0)
-    mosaic = da.where(weight_sum > 1e-6, weighted_sum / weight_sum, np.nan).astype("float32")
     combined = xr.DataArray(
         data,
         dims=("scene", "band", "y", "x"),
@@ -702,6 +987,8 @@ def fetch_raster_stack(
     selection.height = int(stack.sizes.get("y", stack.shape[-2]))
     selection.crs = f"EPSG:{epsg_code}"
     return stack, selection, selection.crs
+
+
 def get_resampling(name: str | None) -> Resampling:
     table = {
         "nearest": Resampling.nearest,
