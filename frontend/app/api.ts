@@ -72,6 +72,33 @@ export async function exportFilterImage(payload: ExportFilterRequest) {
   return res.blob();
 }
 
+export type RoadNetworkStyle = "blueprint" | "gold" | "ink";
+
+export interface RoadNetworkPreviewRequest {
+  aoi: Record<string, unknown>;
+  style: RoadNetworkStyle;
+  width_px: number;
+  height_px: number;
+  seed?: number;
+}
+
+export async function fetchRoadNetworkPreview(
+  payload: RoadNetworkPreviewRequest,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/roads/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) {
+    const message = await res.text();
+    throw new Error(message || "Roads preview failed");
+  }
+  return res.blob();
+}
+
 // Legacy types kept for compatibility with existing components (pickers toggled off in new UI).
 export type Theme = "true" | "false_veg" | "ndvi" | "pca" | "geology" | "decorr" | "nmf" | "index_triplet";
 export type Palette = "vivid" | "warm" | "cool" | "neutral" | "random";

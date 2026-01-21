@@ -2,7 +2,6 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import maplibregl, { type Map, type StyleSpecification, type ImageSource as MapImageSource } from "maplibre-gl";
-import "maplibre-gl/dist/maplibre-gl.css";
 
 type BasemapMode = "imagery" | "vector";
 type AoiRect = { x: number; y: number; width: number; height: number };

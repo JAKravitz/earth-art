@@ -10,6 +10,8 @@ xarray==2024.3.0
 rasterio==1.4.2
 pillow==11.1.0
 shapely==2.1.2
+geopandas==0.14.4
+osmnx==1.9.4
 pyproj==3.7.2
 requests==2.32.3
 python-dotenv==1.0.1
