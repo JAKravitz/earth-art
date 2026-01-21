@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
+import "maplibre-gl/dist/maplibre-gl.css";
 import { EarthsySessionProvider } from "./context/EarthsySession";
 import EarthsyLogo from "./components/EarthsyLogo";
 

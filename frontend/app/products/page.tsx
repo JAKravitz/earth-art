@@ -6,7 +6,7 @@ import EarthsyLogo from "../components/EarthsyLogo";
 const cards = [
   {
     id: "solid-earth",
-    title: "Solid Earth",
+    title: "Spectral Earth",
     href: "/solid-earth",
     description: "Spectral landscapes, geology, and mineral textures. PCA, MNF, and false-color blends.",
     image:
@@ -21,10 +21,10 @@ const cards = [
       "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80",
   },
   {
-    id: "urban",
-    title: "Urban",
-    href: "/urban",
-    description: "Roads, buildings, and human patterns. Vector-based city art. Coming soon.",
+    id: "roads",
+    title: "Road Networks",
+    href: "/roads/playground",
+    description: "Roads, highways, and connective tissue. Vector-based network art.",
     image:
       "https://images.unsplash.com/photo-1433838552652-f9a46b332c40?auto=format&fit=crop&w=1200&q=80",
   },

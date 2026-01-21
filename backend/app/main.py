@@ -23,6 +23,7 @@ from app.models import (
 from app.processing import compose, fetch, overlays, render
 from app.processing.fetch import SceneNotFoundError, SceneSearchError, SceneValidationError
 from app.processing.filters import render_filter
+from app.roads import router as roads_router
 
 LOGGER = logging.getLogger(__name__)
 PREVIEW_MAX_PX = int(os.getenv("PREVIEW_MAX_PX", "2048"))
@@ -52,6 +53,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(roads_router)
 
 
 @app.get("/health")
