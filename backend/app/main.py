@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import threading
+import time
 import asyncio
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 from fastapi import FastAPI, HTTPException, Response, status
@@ -27,6 +31,7 @@ from app.roads import router as roads_router
 
 LOGGER = logging.getLogger(__name__)
 PREVIEW_MAX_PX = int(os.getenv("PREVIEW_MAX_PX", "2048"))
+PREVIEW_STACK_CACHE_TTL_SEC = int(os.getenv("PREVIEW_STACK_CACHE_TTL_SEC", "300"))
 PREVIEW_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(4, min(8, os.cpu_count() or 4)),
     thread_name_prefix="preview",
@@ -156,6 +161,31 @@ def export(request: ExportRequest) -> Response:
     )
 
 
+# In-memory cache for filter preview stack so "true-color first, then rest" reuses the same stack.
+_PREVIEW_STACK_CACHE: Dict[str, Tuple[float, Any, Any]] = {}
+_PREVIEW_STACK_CACHE_LOCK = threading.Lock()
+
+
+def _preview_stack_cache_key(request: BatchPreviewRequest) -> str:
+    date_range_str = request.date_range.to_timerange() if request.date_range else ""
+    payload = {
+        "lat": request.lat,
+        "lon": request.lon,
+        "size_km": request.size_km,
+        "aoi_bounds": list(request.aoi_bounds) if request.aoi_bounds else None,
+        "themeId": request.themeId,
+        "date_range": date_range_str,
+        "target_size_px": request.target_size_px,
+    }
+    raw = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _materialize_stack(stack):
+    """Compute dask stack to in-memory array. Use threads scheduler; num_workers can break in some dask versions."""
+    return stack.copy(data=stack.data.compute(scheduler="threads"))
+
+
 def _prepare_stack_for_filters(
     lat: float,
     lon: float,
@@ -177,21 +207,40 @@ def _prepare_stack_for_filters(
 
 @app.post("/filters/preview", response_model=BatchPreviewResponse)
 def batch_preview(request: BatchPreviewRequest) -> BatchPreviewResponse:
-    try:
-        stack, selection, _ = _prepare_stack_for_filters(
-            request.lat,
-            request.lon,
-            request.size_km,
-            request.target_size_px,
-            date_range=_date_range(request),
-            aoi_bounds=tuple(request.aoi_bounds) if request.aoi_bounds else None,
-        )
-        # Ensure previews reuse an in-memory stack instead of recomputing dask
-        # graphs per filter, which can time out and yield black placeholders.
-        if hasattr(stack.data, "compute"):
-            stack = stack.copy(data=stack.data.compute())
-    except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    cache_key = _preview_stack_cache_key(request)
+    stack = None
+    selection = None
+
+    with _PREVIEW_STACK_CACHE_LOCK:
+        entry = _PREVIEW_STACK_CACHE.get(cache_key)
+        if entry is not None:
+            expires_at, cached_stack, cached_selection = entry
+            if time.monotonic() < expires_at:
+                stack = cached_stack
+                selection = cached_selection
+                LOGGER.info("Preview stack cache hit key=%s", cache_key[:12])
+
+    if stack is None or selection is None:
+        try:
+            stack, selection, _ = _prepare_stack_for_filters(
+                request.lat,
+                request.lon,
+                request.size_km,
+                request.target_size_px,
+                date_range=_date_range(request),
+                aoi_bounds=tuple(request.aoi_bounds) if request.aoi_bounds else None,
+            )
+            if hasattr(stack.data, "compute"):
+                stack = _materialize_stack(stack)
+            with _PREVIEW_STACK_CACHE_LOCK:
+                _PREVIEW_STACK_CACHE[cache_key] = (
+                    time.monotonic() + PREVIEW_STACK_CACHE_TTL_SEC,
+                    stack,
+                    selection,
+                )
+            LOGGER.info("Preview stack cache stored key=%s", cache_key[:12])
+        except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     results: List[BatchPreviewItem] = []
 
@@ -250,7 +299,7 @@ def export_filter(request: ExportFilterRequest) -> Response:
             aoi_bounds=tuple(request.aoi_bounds) if request.aoi_bounds else None,
         )
         if hasattr(stack.data, "compute"):
-            stack = stack.copy(data=stack.data.compute())
+            stack = _materialize_stack(stack)
     except (SceneNotFoundError, SceneValidationError, SceneSearchError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 

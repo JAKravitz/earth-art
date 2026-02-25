@@ -34,20 +34,26 @@ MOSAIC_WEIGHT_DOWNSAMPLE = max(1, int(os.getenv("MOSAIC_WEIGHT_DOWNSAMPLE", "4")
 MOSAIC_HARMONIZE = os.getenv("MOSAIC_HARMONIZE", "true").lower() not in ("0", "false", "no")
 MOSAIC_HARMONIZE_PLOW = float(os.getenv("MOSAIC_HARMONIZE_PLOW", "10"))
 MOSAIC_HARMONIZE_PHIGH = float(os.getenv("MOSAIC_HARMONIZE_PHIGH", "90"))
-MOSAIC_HARMONIZE_STRIDE = max(1, int(os.getenv("MOSAIC_HARMONIZE_STRIDE", "6")))
+MOSAIC_HARMONIZE_STRIDE = max(1, int(os.getenv("MOSAIC_HARMONIZE_STRIDE", "8")))
 MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS = int(os.getenv("MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS", "4000"))
 MOSAIC_HARMONIZE_GAIN_MIN = float(os.getenv("MOSAIC_HARMONIZE_GAIN_MIN", "0.6"))
 MOSAIC_HARMONIZE_GAIN_MAX = float(os.getenv("MOSAIC_HARMONIZE_GAIN_MAX", "1.7"))
 MOSAIC_HARMONIZE_CLAMP_MIN = float(os.getenv("MOSAIC_HARMONIZE_CLAMP_MIN", "0.0"))
 MOSAIC_HARMONIZE_CLAMP_MAX = float(os.getenv("MOSAIC_HARMONIZE_CLAMP_MAX", "1.5"))
 MOSAIC_HARMONIZE_BRIGHT_CLIP_PCT = float(os.getenv("MOSAIC_HARMONIZE_BRIGHT_CLIP_PCT", "98"))
+# Chunk size for stackstac. 2048 is safe; smaller (e.g. 512) can cause many tiny COG reads and slow/hang.
+STACK_CHUNKSIZE = max(512, min(2048, int(os.getenv("STACK_CHUNKSIZE", "2048"))))
+# Harmonization: sample at 1/downsample resolution (faster). Gains applied at full res.
+MOSAIC_HARMONIZE_DOWNSAMPLE = max(1, int(os.getenv("MOSAIC_HARMONIZE_DOWNSAMPLE", "2")))
 GEOD = Geod(ellps="WGS84")
 WGS84 = "EPSG:4326"
 EQUAL_AREA_CRS = "EPSG:6933"
 # Prefer a global equal-area transform for coverage calcs to avoid lat/long distortion.
 EQUAL_AREA_TRANSFORMER = Transformer.from_crs(WGS84, EQUAL_AREA_CRS, always_xy=True)
-# Search windows (days, cloud limit used for single-scene lookups); mosaics score cloud later.
+# Search windows (days, max eo:cloud_cover %). Single-scene and mosaic both filter by this.
 SEARCH_WINDOWS = ((90, 5), (365, 20))
+# Optional stricter cap for mosaic only (no scenes above this); 0 = use SEARCH_WINDOWS only.
+MOSAIC_MAX_CLOUD_PCT = float(os.getenv("MOSAIC_MAX_CLOUD_PCT", "20"))
 LOGGER = logging.getLogger(__name__)
 ALIAS_COMMON_NAME = {
     "B02": ["blue"],
@@ -564,14 +570,19 @@ def find_scenes_for_aoi(
         LOGGER.warning(msg)
         raise SceneSearchError(msg) from exc
 
-    for days, _cloud in SEARCH_WINDOWS:
+    for days, cloud_pct in SEARCH_WINDOWS:
         datetime_filter = date_range or _default_datetime(days)
+        # Restrict to scenes below cloud threshold so mosaics are not dominated by clouds.
+        max_cloud = min(cloud_pct, MOSAIC_MAX_CLOUD_PCT) if MOSAIC_MAX_CLOUD_PCT > 0 else cloud_pct
+        query = {"eo:cloud_cover": {"lt": max_cloud}}
+        LOGGER.info("Scene search window days=%s max_cloud_pct=%s", days, max_cloud)
         search = client.search(
             collections=[collection],
             bbox=aoi_bounds,
             limit=candidate_limit,
             sortby=[{"field": "properties.datetime", "direction": "desc"}],
             datetime=datetime_filter,
+            query=query,
             fields={
                 "include": [
                     "id",
@@ -661,7 +672,7 @@ def load_scene_stack(
             epsg=epsg_code,
             resolution=resolution,
             resampling=selected,
-            chunksize=2048,
+            chunksize=STACK_CHUNKSIZE,
             rescale=False,
             fill_value=np.nan,
         )
@@ -733,7 +744,7 @@ def build_mosaic_stack(
             epsg=epsg_code,
             resolution=target_resolution,
             resampling=resampling,
-            chunksize=2048,
+            chunksize=STACK_CHUNKSIZE,
             rescale=False,
             fill_value=np.nan,
         )
@@ -823,12 +834,18 @@ def build_mosaic_stack(
 
     if MOSAIC_HARMONIZE and len(stacks) > 1:
         harmonize_start = time.perf_counter()
+        stride = MOSAIC_HARMONIZE_STRIDE
+        downsample = MOSAIC_HARMONIZE_DOWNSAMPLE
+        step = stride * downsample
+        min_overlap_scaled = max(100, int(MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS / (step * step)))
         LOGGER.info(
-            "Mosaic harmonization enabled plow=%.1f phigh=%.1f stride=%d min_overlap=%d gain_clip=[%.3f, %.3f] clamp=[%.2f, %.2f] bright_clip_pct=%.1f",
+            "Mosaic harmonization enabled plow=%.1f phigh=%.1f step=%d (stride=%d down=%d) min_overlap=%d gain_clip=[%.3f, %.3f] clamp=[%.2f, %.2f] bright_clip_pct=%.1f",
             MOSAIC_HARMONIZE_PLOW,
             MOSAIC_HARMONIZE_PHIGH,
-            MOSAIC_HARMONIZE_STRIDE,
-            MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS,
+            step,
+            stride,
+            downsample,
+            min_overlap_scaled,
             MOSAIC_HARMONIZE_GAIN_MIN,
             MOSAIC_HARMONIZE_GAIN_MAX,
             MOSAIC_HARMONIZE_CLAMP_MIN,
@@ -839,21 +856,21 @@ def build_mosaic_stack(
         for idx in range(1, len(stacks)):
             scene_id = selection_log[idx]["id"]
             scene_data = raw_stacks[idx].data
-            stride = MOSAIC_HARMONIZE_STRIDE
-            sample_ref = ref_data[:, ::stride, ::stride]
-            sample_scene = scene_data[:, ::stride, ::stride]
+            # Sample at coarser step (downsampled + stride) for faster percentile/gain computation.
+            sample_ref = ref_data[:, ::step, ::step]
+            sample_scene = scene_data[:, ::step, ::step]
             valid_ref = da.isfinite(sample_ref).all(axis=0) & da.all(sample_ref > 0, axis=0)
             valid_scene = da.isfinite(sample_scene).all(axis=0) & da.all(sample_scene > 0, axis=0)
             overlap_mask = valid_ref & valid_scene
             ref_np, scene_np, mask_np = da.compute(sample_ref, sample_scene, overlap_mask)
             mask_np = np.asarray(mask_np, dtype=bool)
             overlap_pixels = int(mask_np.sum())
-            if overlap_pixels < MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS:
+            if overlap_pixels < min_overlap_scaled:
                 LOGGER.info(
                     "Mosaic harmonize scene=%s skipped (overlap=%d < min=%d)",
                     scene_id,
                     overlap_pixels,
-                    MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS,
+                    min_overlap_scaled,
                 )
                 continue
             bright_clip_pct = MOSAIC_HARMONIZE_BRIGHT_CLIP_PCT
@@ -865,12 +882,12 @@ def build_mosaic_stack(
                         bright_mask = brightness <= bright_thresh
                         mask_np = mask_np & bright_mask
                         overlap_pixels = int(mask_np.sum())
-                        if overlap_pixels < MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS:
+                        if overlap_pixels < min_overlap_scaled:
                             LOGGER.info(
                                 "Mosaic harmonize scene=%s skipped after bright clip (overlap=%d < min=%d)",
                                 scene_id,
                                 overlap_pixels,
-                                MOSAIC_HARMONIZE_MIN_OVERLAP_PIXELS,
+                                min_overlap_scaled,
                             )
                             continue
             masked_ref = np.where(mask_np, ref_np, np.nan)
@@ -965,7 +982,12 @@ def fetch_raster_stack(
     if len(selections) == 1:
         selection = selections[0]
         stack, epsg_code = load_scene_stack(
-            selection.item, selection.bbox, asset_ids, target_pixels, labels, resampling
+            selection.item,
+            selection.bbox,
+            asset_ids,
+            target_pixels,
+            labels,
+            resampling,
         )
     else:
         stack = build_mosaic_stack(

@@ -122,7 +122,11 @@ export default function SolidEarthEditor() {
         <h3>Filters</h3>
         <div className="thumbs">
           {filters.map((f) => (
-            <button key={f.id} className={`thumb ${currentId === f.id ? "active" : ""}`} onClick={() => setSelectedFilterId(f.id)}>
+            <button
+              key={f.id}
+              className={`thumb ${currentId === f.id ? "active" : ""}`}
+              onClick={() => setSelectedFilterId(f.id)}
+            >
               <div className="mini">
                 {previewsByFilterId[f.id]?.imageUrl ? (
                   <img src={previewsByFilterId[f.id].imageUrl} alt={f.name} />
