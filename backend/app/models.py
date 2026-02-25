@@ -152,6 +152,7 @@ class ExportFilterRequest(BaseModel):
     lon: float = Field(..., ge=-180.0, le=180.0)
     size_km: float = Field(10.0, ge=1.0, le=100.0)
     aoi_bounds: Optional[List[float]] = None
+    date_range: Optional[DateRange] = None
     filter: FilterSpec
     target_size_px: PositiveInt = Field(4096, le=8192)
     watermark: Optional[str] = Field(default=None, max_length=64)
