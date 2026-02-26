@@ -1,0 +1,24 @@
+# Use this with the River REM conda env (conda install -c conda-forge riverrem first).
+# RiverREM requires OSMnx 1.x (it uses geometries_from_bbox, removed in OSMnx 2).
+# Conda's riverrem brings in osmnx>=1.3,<2; keep that range if you pip-install other deps.
+
+--extra-index-url https://pypi.anaconda.org/conda-forge/simple
+
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.10.6
+pystac-client==0.7.4
+stackstac==0.5.1
+numpy>=1.26.4,<3
+xarray==2024.3.0
+rasterio>=1.4.2
+pillow>=11.1.0
+shapely>=2.0,<2.2
+geopandas>=1.0
+osmnx>=1.3,<2
+pyproj>=3.7.2
+requests==2.32.3
+python-dotenv==1.0.1
+pytest==8.2.2
+scikit-learn>=1.3
+scikit-image>=0.22.0

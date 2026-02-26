@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
+from dotenv import load_dotenv
+
+# Load .env from backend directory so OPENTOPOGRAPHY_API_KEY etc. are set
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path)
+
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,6 +33,7 @@ from app.models import (
 from app.processing import compose, fetch, overlays, render
 from app.processing.fetch import SceneNotFoundError, SceneSearchError, SceneValidationError
 from app.processing.filters import render_filter
+from app.rem import router as rem_router
 from app.roads import router as roads_router
 
 LOGGER = logging.getLogger(__name__)
@@ -58,6 +65,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(rem_router)
 app.include_router(roads_router)
 
 
