@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import tempfile
@@ -15,6 +16,10 @@ from pydantic import BaseModel, Field
 import rasterio
 from rasterio.enums import Resampling
 import requests
+from shapely.geometry import box, mapping, shape
+from shapely.ops import unary_union
+from shapely import make_valid
+from shapely.errors import GEOSException
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
@@ -301,6 +306,8 @@ def rem_export(request: REMExportRequest) -> Response:
 # USGS 3DEP Elevation Index: layer 1 = 1 m DEM footprint (lidar-derived), for "show where DEMs exist"
 THREEDEP_INDEX_URL = "https://index.nationalmap.gov/arcgis/rest/services/3DEPElevationIndex/MapServer/1/query"
 
+EMPTY_GEOJSON_FC = b'{"type":"FeatureCollection","features":[]}'
+
 
 @router.get("/rem/3dep-coverage")
 def rem_3dep_coverage(
@@ -317,9 +324,11 @@ def rem_3dep_coverage(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="bbox must be west,south,east,north (four comma-separated numbers)",
         ) from e
+    # ArcGIS MapServer query expects envelope as xmin,ymin,xmax,ymax (comma-separated); JSON envelope can cause 500
+    geometry_str = f"{west},{south},{east},{north}"
     params = {
         "geometryType": "esriGeometryEnvelope",
-        "geometry": f'{{"xmin":{west},"ymin":{south},"xmax":{east},"ymax":{north}}}',
+        "geometry": geometry_str,
         "inSR": "4326",
         "spatialRel": "esriSpatialRelIntersects",
         "returnGeometry": "true",
@@ -327,6 +336,109 @@ def rem_3dep_coverage(
         "outFields": "*",
         "f": "geojson",
     }
-    resp = requests.get(THREEDEP_INDEX_URL, params=params, timeout=30)
-    resp.raise_for_status()
-    return Response(content=resp.content, media_type="application/geo+json")
+    try:
+        resp = requests.get(THREEDEP_INDEX_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        return Response(content=resp.content, media_type="application/geo+json")
+    except requests.RequestException as e:
+        LOGGER.warning("3DEP coverage request failed: %s", e)
+        return Response(content=EMPTY_GEOJSON_FC, media_type="application/geo+json")
+
+
+def _fetch_3dep_coverage_geojson(west: float, south: float, east: float, north: float) -> dict:
+    """Fetch 3DEP 1m coverage for bbox; return parsed GeoJSON dict or empty FeatureCollection."""
+    geometry_str = f"{west},{south},{east},{north}"
+    params = {
+        "geometryType": "esriGeometryEnvelope",
+        "geometry": geometry_str,
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "outFields": "*",
+        "f": "geojson",
+    }
+    try:
+        resp = requests.get(THREEDEP_INDEX_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException:
+        return {"type": "FeatureCollection", "features": []}
+
+
+@router.get("/rem/3dep-no-coverage")
+def rem_3dep_no_coverage(bbox: str) -> Response:
+    """Return GeoJSON of polygons where 3DEP 1m has no coverage (bbox minus coverage union)."""
+    try:
+        parts = [float(x.strip()) for x in bbox.split(",")]
+        if len(parts) != 4:
+            raise ValueError("bbox must be west,south,east,north")
+        west, south, east, north = parts
+    except (ValueError, AttributeError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="bbox must be west,south,east,north (four comma-separated numbers)",
+        ) from e
+    bbox_poly = box(west, south, east, north)
+    fc = _fetch_3dep_coverage_geojson(west, south, east, north)
+    features = fc.get("features") or []
+    if not features:
+        out = {
+            "type": "FeatureCollection",
+            "features": [{"type": "Feature", "geometry": mapping(bbox_poly), "properties": {}}],
+        }
+        return Response(content=json.dumps(out).encode(), media_type="application/geo+json")
+    try:
+        geoms = []
+        for f in features:
+            if not f.get("geometry"):
+                continue
+            try:
+                g = shape(f["geometry"])
+                if g.is_empty:
+                    continue
+                # 3DEP polygons can be invalid (self-intersections, slivers); fix before union
+                g = make_valid(g)
+                if g.is_empty or (hasattr(g, "is_valid") and not g.is_valid):
+                    continue
+                geoms.append(g)
+            except Exception:
+                continue
+        if not geoms:
+            out = {
+                "type": "FeatureCollection",
+                "features": [{"type": "Feature", "geometry": mapping(bbox_poly), "properties": {}}],
+            }
+            return Response(content=json.dumps(out).encode(), media_type="application/geo+json")
+        try:
+            union_coverage = unary_union(geoms)
+        except GEOSException:
+            # Snapping to grid can resolve topology/precision conflicts in 3DEP data
+            try:
+                union_coverage = unary_union(geoms, grid_size=1e-9)
+            except (GEOSException, TypeError):
+                LOGGER.warning("3DEP unary_union failed (grid_size may be unsupported); returning empty no-coverage")
+                out = {"type": "FeatureCollection", "features": []}
+                return Response(content=json.dumps(out).encode(), media_type="application/geo+json")
+        no_coverage = bbox_poly.difference(union_coverage) if not union_coverage.is_empty else bbox_poly
+        if no_coverage.is_empty:
+            out = {"type": "FeatureCollection", "features": []}
+        else:
+            # difference can sometimes produce invalid geometry; normalize for GeoJSON
+            try:
+                no_coverage = make_valid(no_coverage)
+            except Exception:
+                pass
+            if no_coverage.is_empty:
+                out = {"type": "FeatureCollection", "features": []}
+            else:
+                geoms_out = no_coverage.geoms if hasattr(no_coverage, "geoms") else [no_coverage]
+                features_out = [{"type": "Feature", "geometry": mapping(g), "properties": {}} for g in geoms_out]
+                out = {"type": "FeatureCollection", "features": features_out}
+        return Response(content=json.dumps(out).encode(), media_type="application/geo+json")
+    except Exception as e:
+        LOGGER.exception("3DEP no-coverage computation failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        ) from e

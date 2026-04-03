@@ -1,0 +1,101 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "region": "Canada" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-125, 48], [-66, 48], [-66, 50], [-125, 50], [-125, 48]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "region": "Mexico - Baja" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-115.5, 24], [-109.5, 24], [-109.5, 32], [-115.5, 32], [-115.5, 24]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "region": "Mexico - mainland west" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-109.5, 24], [-99, 24], [-99, 31], [-109.5, 31], [-109.5, 24]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "region": "Mexico - mainland east" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-97.5, 24], [-86, 24], [-86, 26], [-97.5, 26], [-97.5, 24]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-115, 37], [-113, 37], [-113, 39], [-115, 39], [-115, 37]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-115.5, 42.5], [-112.5, 42.5], [-112.5, 44.5], [-115.5, 44.5], [-115.5, 42.5]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-118.5, 43.5], [-116.5, 43.5], [-116.5, 45], [-118.5, 45], [-118.5, 43.5]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-113, 35.5], [-110.5, 35.5], [-110.5, 37], [-113, 37], [-113, 35.5]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-110, 42], [-107.5, 42], [-107.5, 44], [-110, 44], [-110, 42]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-111.5, 38], [-109.5, 38], [-109.5, 40], [-111.5, 40], [-111.5, 38]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-111.5, 33], [-109, 33], [-109, 34.5], [-111.5, 34.5], [-111.5, 33]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-111, 45], [-106, 45], [-106, 48], [-111, 48], [-111, 45]]]
+      }
+    }
+  ]
+}

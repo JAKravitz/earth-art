@@ -16,7 +16,7 @@ const cards = [
     id: "water",
     title: "Water",
     href: "/water",
-    description: "Rivers, deltas, coastlines, and aquatic textures. Coming soon.",
+    description: "Rivers, deltas, coastlines. River REM and more.",
     image:
       "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80",
   },

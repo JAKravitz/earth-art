@@ -5,7 +5,7 @@ import type { Feature, Polygon } from "geojson";
 import type { ProductPresetId } from "../config/aoiPresets";
 import type { ThemeId } from "../config/themesAndFilters";
 
-type ProductId = "solid-earth" | "water" | "urban" | "roads";
+type ProductId = "solid-earth" | "water" | "urban" | "roads" | "rem";
 
 export type PreviewEntry = {
   imageUrl: string;

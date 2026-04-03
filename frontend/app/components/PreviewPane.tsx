@@ -28,6 +28,12 @@ interface Props {
   onFlyComplete?: () => void;
   onClearPreview?: () => void;
   onSizeCommandHandled?: () => void;
+  /** Optional GeoJSON of polygons to show (e.g. USGS 3DEP 1m DEM coverage). */
+  coverageGeoJson?: GeoJSON.FeatureCollection | null;
+  /** Optional GeoJSON of polygons with *no* coverage (draw in red). Takes precedence over coverageGeoJson when both provided. */
+  noCoverageGeoJson?: GeoJSON.FeatureCollection | null;
+  /** Optional max bounds [west, south, east, north] to restrict panning (e.g. continental USA). */
+  maxBounds?: [number, number, number, number] | null;
 }
 
 const DEFAULT_VIEW: ViewState = { latitude: 32.7157, longitude: -117.1611, zoom: 8 };
@@ -59,6 +65,10 @@ const BASEMAP_STYLES: Record<BasemapMode, StyleSpecification | string> = {
 
 const PREVIEW_SOURCE_ID = "preview-image-source";
 const PREVIEW_LAYER_ID = "preview-image-layer";
+const COVERAGE_SOURCE_ID = "3dep-coverage-source";
+const COVERAGE_LAYER_ID = "3dep-coverage-layer";
+const NO_COVERAGE_SOURCE_ID = "3dep-no-coverage-source";
+const NO_COVERAGE_LAYER_ID = "3dep-no-coverage-layer";
 
 const PreviewPane = ({
   flyToTarget,
@@ -75,6 +85,9 @@ const PreviewPane = ({
   onBoundsChange,
   onMapCenterChange,
   onFlyComplete,
+  coverageGeoJson,
+  noCoverageGeoJson,
+  maxBounds,
 }: Props) => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapCanvasRef = useRef<HTMLDivElement | null>(null);
@@ -299,7 +312,22 @@ const PreviewPane = ({
       map.remove();
       mapRef.current = null;
     };
-  }, []); 
+  }, []);
+
+  // Apply maxBounds when map is ready (e.g. restrict to USA)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    if (maxBounds && maxBounds.length === 4) {
+      const [west, south, east, north] = maxBounds;
+      map.setMaxBounds([
+        [west, south],
+        [east, north],
+      ]);
+    } else {
+      map.setMaxBounds(null as unknown as [[number, number], [number, number]]);
+    }
+  }, [mapReady, maxBounds]);
 
   useEffect(() => {
     if (!mapReady) return;
@@ -397,7 +425,70 @@ const PreviewPane = ({
     applyPreviewLayer();
   }, [activeBounds, applyPreviewLayer, previewImageUrl, removePreviewLayer]);
 
-
+  // Optional 3DEP coverage: green = has coverage, red = no coverage (noCoverageGeoJson takes precedence)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const applyCoverage = () => {
+      [COVERAGE_LAYER_ID, NO_COVERAGE_LAYER_ID].forEach((id) => {
+        if (map.getLayer(id)) map.removeLayer(id);
+      });
+      [COVERAGE_SOURCE_ID, NO_COVERAGE_SOURCE_ID].forEach((id) => {
+        if (map.getSource(id)) map.removeSource(id);
+      });
+      const useNoCoverage = noCoverageGeoJson && noCoverageGeoJson.features?.length;
+      const useCoverage = !useNoCoverage && coverageGeoJson && coverageGeoJson.features?.length;
+      if (useNoCoverage && noCoverageGeoJson) {
+        map.addSource(NO_COVERAGE_SOURCE_ID, { type: "geojson", data: noCoverageGeoJson });
+        map.addLayer(
+          {
+            id: NO_COVERAGE_LAYER_ID,
+            type: "fill",
+            source: NO_COVERAGE_SOURCE_ID,
+            paint: {
+              "fill-color": "#dc2626",
+              "fill-opacity": 0.45,
+              "fill-outline-color": "#b91c1c",
+            },
+          },
+          undefined,
+        );
+      } else if (useCoverage && coverageGeoJson) {
+        map.addSource(COVERAGE_SOURCE_ID, { type: "geojson", data: coverageGeoJson });
+        map.addLayer(
+          {
+            id: COVERAGE_LAYER_ID,
+            type: "fill",
+            source: COVERAGE_SOURCE_ID,
+            paint: {
+              "fill-color": "#22c55e",
+              "fill-opacity": 0.45,
+              "fill-outline-color": "#16a34a",
+            },
+          },
+          undefined,
+        );
+      }
+    };
+    if (!map.isStyleLoaded()) {
+      const handler = () => applyCoverage();
+      map.once("styledata", handler);
+      return () => {
+        map.off("styledata", handler);
+      };
+    }
+    applyCoverage();
+    return () => {
+      const m = mapRef.current;
+      if (!m) return;
+      [COVERAGE_LAYER_ID, NO_COVERAGE_LAYER_ID].forEach((id) => {
+        if (m.getLayer(id)) m.removeLayer(id);
+      });
+      [COVERAGE_SOURCE_ID, NO_COVERAGE_SOURCE_ID].forEach((id) => {
+        if (m.getSource(id)) m.removeSource(id);
+      });
+    };
+  }, [mapReady, coverageGeoJson, noCoverageGeoJson]);
 
   useEffect(() => {
     const map = mapRef.current;

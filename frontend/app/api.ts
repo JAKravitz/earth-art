@@ -99,6 +99,95 @@ export async function fetchRoadNetworkPreview(
   return res.blob();
 }
 
+export interface REMPreviewRequest {
+  bbox: [number, number, number, number];
+  target_size_px?: number;
+  colormap?: string;
+}
+
+export interface REMExportRequest {
+  bbox: [number, number, number, number];
+  target_size_px: number;
+  colormap?: string;
+}
+
+/** Fetch USGS 3DEP 1 m DEM coverage polygons for a bbox (for "show where DEMs exist" layer). */
+export async function fetch3depCoverage(
+  bbox: [number, number, number, number],
+): Promise<GeoJSON.FeatureCollection> {
+  const [west, south, east, north] = bbox;
+  const res = await fetch(
+    `${API_BASE}/rem/3dep-coverage?bbox=${west},${south},${east},${north}`,
+  );
+  if (!res.ok) throw new Error("Failed to fetch 3DEP coverage");
+  const data = (await res.json()) as GeoJSON.FeatureCollection | { features?: unknown[] };
+  // Normalize: ensure we have a FeatureCollection with an array (ArcGIS can wrap or error)
+  const features = Array.isArray((data as GeoJSON.FeatureCollection).features)
+    ? (data as GeoJSON.FeatureCollection).features
+    : [];
+  return { type: "FeatureCollection", features };
+}
+
+/** Fetch polygons where 3DEP 1m has *no* coverage (bbox minus coverage). Show in red on map. */
+export async function fetch3depNoCoverage(
+  bbox: [number, number, number, number],
+): Promise<GeoJSON.FeatureCollection> {
+  const [west, south, east, north] = bbox;
+  const res = await fetch(
+    `${API_BASE}/rem/3dep-no-coverage?bbox=${west},${south},${east},${north}`,
+  );
+  if (!res.ok) throw new Error("Failed to fetch 3DEP no-coverage");
+  const data = (await res.json()) as GeoJSON.FeatureCollection | { features?: unknown[] };
+  const features = Array.isArray((data as GeoJSON.FeatureCollection).features)
+    ? (data as GeoJSON.FeatureCollection).features
+    : [];
+  return { type: "FeatureCollection", features };
+}
+
+export async function remPreview(
+  payload: REMPreviewRequest,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/rem/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text || "REM preview failed";
+    try {
+      const json = JSON.parse(text) as { detail?: string };
+      if (typeof json.detail === "string") message = json.detail;
+    } catch {
+      // use text as-is
+    }
+    throw new Error(message);
+  }
+  return res.blob();
+}
+
+export async function remExport(payload: REMExportRequest): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/rem/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text || "REM export failed";
+    try {
+      const json = JSON.parse(text) as { detail?: string };
+      if (typeof json.detail === "string") message = json.detail;
+    } catch {
+      // use text as-is
+    }
+    throw new Error(message);
+  }
+  return res.blob();
+}
+
 // Legacy types kept for compatibility with existing components (pickers toggled off in new UI).
 export type Theme = "true" | "false_veg" | "ndvi" | "pca" | "geology" | "decorr" | "nmf" | "index_triplet";
 export type Palette = "vivid" | "warm" | "cool" | "neutral" | "random";
